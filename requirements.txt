@@ -1,5 +1,5 @@
-﻿streamlit
-pandas
-numpy
-beautifulsoup4
-pywin32; platform_system == "Windows"
+streamlit>=1.31
+pandas>=2.0
+numpy>=1.24
+beautifulsoup4>=4.12
+pywin32>=306

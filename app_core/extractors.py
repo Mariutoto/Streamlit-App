@@ -5,7 +5,7 @@ from typing import Callable, Optional
 import pandas as pd
 from bs4 import BeautifulSoup
 
-from .html_utils import normalize_html_rows, extract_best_table
+from .html_utils import normalize_html_rows
 
 
 def _load_existing_extractors_module():
@@ -23,83 +23,83 @@ def _load_existing_extractors_module():
 _EXT_MOD = _load_existing_extractors_module()
 
 
-def _call_or_generic(func_name: str, html: str) -> Optional[pd.DataFrame]:
+def _call_specific(func_name: str, html: str) -> Optional[pd.DataFrame]:
+    """Call only the issuer-specific extractor if present; no generic fallback."""
     if _EXT_MOD and hasattr(_EXT_MOD, func_name):
         try:
             return getattr(_EXT_MOD, func_name)(html)
         except Exception:
-            pass
-    # Fallback generic
-    return extract_best_table(html)
+            return None
+    return None
 
 
 # Individual extractors (issuer names kept consistent with run_parser expectations)
 def extract_natixis(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_natixis", html)
+    return _call_specific("extract_natixis", html)
 
 
 def extract_citi(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_citi", html)
+    return _call_specific("extract_citi", html)
 
 
 def extract_bofa(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_bofa", html)
+    return _call_specific("extract_bofa", html)
 
 
 def extract_socgen(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_socgen", html)
+    return _call_specific("extract_socgen", html)
 
 
 def extract_gs(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_gs", html)
+    return _call_specific("extract_gs", html)
 
 
 def extract_bnp(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_bnp", html)
+    return _call_specific("extract_bnp", html)
 
 
 def extract_lukb(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_lukb", html)
+    return _call_specific("extract_lukb", html)
 
 
 def extract_jb(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_jb", html)
+    return _call_specific("extract_jb", html)
 
 
 def extract_hsbc(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_hsbc", html)
+    return _call_specific("extract_hsbc", html)
 
 
 def extract_ms(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_ms", html)
+    return _call_specific("extract_ms", html)
 
 
 def extract_ubs(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_ubs", html)
+    return _call_specific("extract_ubs", html)
 
 
 def extract_marex(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_marex", html)
+    return _call_specific("extract_marex", html)
 
 
 def extract_bbva(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_bbva", html)
+    return _call_specific("extract_bbva", html)
 
 
 def extract_cibc(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_cibc", html)
+    return _call_specific("extract_cibc", html)
 
 
 def extract_barclays(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_barclays", html)
+    return _call_specific("extract_barclays", html)
 
 
 def extract_leonteq(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_leonteq", html)
+    return _call_specific("extract_leonteq", html)
 
 
 def extract_swissquote(html: str) -> Optional[pd.DataFrame]:
-    return _call_or_generic("extract_swissquote", html)
+    return _call_specific("extract_swissquote", html)
 
 
 EXTRACTOR_BY_ISSUER = {
@@ -152,6 +152,6 @@ def extract_for_sender(html: str, sender: str) -> tuple[pd.DataFrame | None, str
             func = EXTRACTOR_BY_ISSUER.get(issuer)
             if func:
                 return func(html), issuer
-    # Unknown sender → best generic
-    return extract_best_table(html), None
-
+            return None, issuer
+    # Unknown sender → do not fallback to generic
+    return None, None

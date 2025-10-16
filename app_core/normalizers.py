@@ -26,56 +26,21 @@ def _try_call_specific(norm_name: str, df: pd.DataFrame) -> Optional[pd.DataFram
     return None
 
 
-def _generic_normalize(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # Generic column harmonization
-    rename_candidates = {
-        "product": ["Product", "Product Name", "Ref"],
-        "currency": ["Currency", "Ccy"],
-        "tenor": ["Tenor", "Tenor (m)", "Tenor (M)", "Maturity (m)", "Maturity"],
-        "strike": ["Strike", "Strike (%)", "Strike %"],
-        "barrier": ["KI Barrier (%)", "Barrier (%)", "Barrier"],
-        "barrier_type": ["Barrier Type", "KI Type"],
-        "autocall_barrier": ["Autocall Barrier (%)", "Autocall Level (%)", "Early Termination Level (%)", "Trigger Level (%)"],
-        "autocall_frequency": ["Autocall Frequency", "Frequency", "KO Frequency", "Early Termination Period"],
-        "no_call_period": ["No Call Period", "Non Callable Period", "Non Autocallable Period", "Autocall From Period"],
-        "coupon": ["Coupon p.a. (%)", "Coupon (%)", "Fixed Coupon p.a. (%)"],
-        "reoffer": ["Reoffer (%)", "Upfront (%)", "Issue Price (%)"],
-        "underlying_1": ["BBG Code 1", "Underlying 1"],
-        "underlying_2": ["BBG Code 2", "Underlying 2"],
-        "underlying_3": ["BBG Code 3", "Underlying 3"],
-        "underlying_4": ["BBG Code 4", "Underlying 4"],
-        "underlying_5": ["BBG Code 5", "Underlying 5"],
-    }
-    rename_map = {}
-    for target, variants in rename_candidates.items():
-        for v in variants:
-            if v in df.columns:
-                rename_map[v] = target
-                break
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    # Ensure issuer column exists (filled later by caller)
-    if "issuer" not in df.columns:
-        df["issuer"] = pd.NA
-    return df
+# Removed generic normalizer: enforce issuer-specific normalizers only
 
 
-def normalize(df: pd.DataFrame, issuer: str | None) -> pd.DataFrame:
-    """Normalize and then apply universal cleanup."""
+def normalize(df: pd.DataFrame, issuer: str | None) -> Optional[pd.DataFrame]:
+    """Apply only issuer-specific normalizers followed by universal cleanup; no generic fallback."""
     issuer_key = (issuer or "").lower()
 
-    # Try specific normalizer from user's module first
-    if issuer_key:
-        cand = _try_call_specific(f"normalize_{issuer_key}", df)
-        if cand is not None:
-            dfn = cand
-        else:
-            dfn = _generic_normalize(df)
-    else:
-        dfn = _generic_normalize(df)
+    if not issuer_key:
+        return None
 
-    # Ensure issuer column is set; avoid fillna(None)
+    cand = _try_call_specific(f"normalize_{issuer_key}", df)
+    if cand is None:
+        return None
+
+    dfn = cand.copy()
     if "issuer" not in dfn.columns:
         dfn["issuer"] = issuer if issuer is not None else pd.NA
     else:

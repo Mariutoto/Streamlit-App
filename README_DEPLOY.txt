@@ -22,3 +22,22 @@ Troubleshooting
 - "Failed building wheel" or install errors: Update pip (`python -m pip install --upgrade pip`) and retry run_app.bat. Corporate proxies may require additional pip configuration.
 - Outlook automation errors: Ensure Outlook is installed, running, and a profile/mailbox is configured. You can still use the non-Outlook input modes.
 
+
+Build a self-contained EXE (PyInstaller)
+----------------------------------------
+This creates a distributable folder that does NOT require a Python installation on the target PC (Outlook still required).
+
+Steps to build on your machine:
+- Double-click `build_exe.bat` (or run it from a terminal).
+- It creates a `.venv`, installs deps + PyInstaller, and builds into `dist/EmailPricerParser/`.
+- Launch the app by running `dist\EmailPricerParser\EmailPricerParser.exe`.
+
+What’s inside the EXE build:
+- `EmailPricerParser.exe`: a launcher that starts Streamlit in-process via `launch_streamlit.py`.
+- Your app code (`streamlit_app.py`, `app_core`, `Normalizers.py`, `Extractors.py`) is included as data so the launcher can load the script by path.
+- Hidden imports are included for Outlook COM (pywin32).
+
+Notes for EXE usage:
+- The first run may be slower while Streamlit initializes.
+- If Windows SmartScreen shows a warning, click “More info” → “Run anyway” (unsigned EXE).
+- Outlook (classic desktop) must be installed and configured on the target PC; the “New Outlook” Store app does not support COM automation.

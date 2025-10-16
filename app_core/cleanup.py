@@ -20,14 +20,30 @@ def universal_cleanup(df: pd.DataFrame, issuer: str | None = None) -> pd.DataFra
         if col not in df.columns:
             df[col] = np.nan
 
+    # If issuer-level normalizers created duplicate canonical columns
+    # (e.g., multiple variants renamed to the same final name), merge them
+    # into a single Series by taking the first non-null across duplicates.
+    if df.columns.duplicated().any():
+        dup_names = set(df.columns[df.columns.duplicated()])
+        for name in dup_names:
+            cols = [c for c in df.columns if c == name]
+            merged = df.loc[:, cols].bfill(axis=1).iloc[:, 0]
+            df = df.drop(columns=cols)
+            df[name] = merged
+
     # Blank/NA normalization
     df = df.replace(r"^\s*$", np.nan, regex=True)
     df = df.replace({pd.NA: np.nan})
 
     # Numeric cleanup
     for col in ["coupon", "strike", "barrier", "reoffer", "autocall_barrier"]:
-        df[col] = df[col].astype(str).str.replace("%", "", regex=False)
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            s = df[col]
+            # Guard in case `s` is a DataFrame due to unexpected duplicates
+            if isinstance(s, pd.DataFrame):
+                s = s.bfill(axis=1).iloc[:, 0]
+            s = s.astype(str).str.replace("%", "", regex=False)
+            df[col] = pd.to_numeric(s, errors="coerce")
 
     # Tenor to months
     def _parse_tenor_to_months(x):
@@ -114,4 +130,3 @@ def universal_cleanup(df: pd.DataFrame, issuer: str | None = None) -> pd.DataFra
     # Enforce required order (subset safe)
     cols = [c for c in REQUIRED_COLS if c in df.columns]
     return df[cols]
-

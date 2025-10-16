@@ -5,6 +5,7 @@ from typing import Optional
 import pandas as pd
 
 from .cleanup import universal_cleanup
+from .issuers import load_local_normalizer, load_legacy_normalizer
 
 
 def _load_existing_normalizers_module():
@@ -17,27 +18,31 @@ def _load_existing_normalizers_module():
 _NORM_MOD = _load_existing_normalizers_module()
 
 
-def _try_call_specific(norm_name: str, df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    if _NORM_MOD and hasattr(_NORM_MOD, norm_name):
-        try:
-            return getattr(_NORM_MOD, norm_name)(df)
-        except Exception:
-            return None
-    return None
-
-
 # Removed generic normalizer: enforce issuer-specific normalizers only
 
 
 def normalize(df: pd.DataFrame, issuer: str | None) -> Optional[pd.DataFrame]:
-    """Apply only issuer-specific normalizers followed by universal cleanup; no generic fallback."""
-    issuer_key = (issuer or "").lower()
+    """Run issuer-specific normalizer then universal cleanup.
 
+    Resolution order:
+    1) app_core.issuers.<issuer>.normalize(df)
+    2) Normalizers.normalize_<issuer>(df)  [legacy/toplevel]
+    """
+    issuer_key = (issuer or "").lower()
     if not issuer_key:
         return None
 
-    cand = _try_call_specific(f"normalize_{issuer_key}", df)
-    if cand is None:
+    # Prefer legacy Normalizers.py first (has richer mappings today)
+    func = load_legacy_normalizer(issuer_key)
+    if not func:
+        # Fallback to local per-issuer module (customizable stubs)
+        func = load_local_normalizer(issuer_key)
+    if not func:
+        return None
+
+    try:
+        cand = func(df)
+    except Exception:
         return None
 
     dfn = cand.copy()

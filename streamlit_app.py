@@ -17,10 +17,31 @@ from app_core.email_integration import (
     resolve_smtp,
 )
 from app_core.pipeline import run_on_html, run_outlook
+from app_core.ticker_lookup import suggest_tickers, has_openfigi_key
+from app_core.ticker_store import load_tickers_csv, search_local_tickers
+
+# Optional autocomplete component
+try:
+    from streamlit_searchbox import st_searchbox  # type: ignore
+    _HAS_SEARCHBOX = True
+except Exception:
+    _HAS_SEARCHBOX = False
 
 
 st.set_page_config(page_title="Email Pricer Parser", layout="wide")
 st.title("Email Pricer Parser")
+
+# Make OPENFIGI_API_KEY available from Streamlit secrets if provided
+try:
+    if "OPENFIGI_API_KEY" in st.secrets:
+        os.environ["OPENFIGI_API_KEY"] = st.secrets["OPENFIGI_API_KEY"]
+except Exception:
+    pass
+
+# Top-level tabs: keep existing parser flow and add an Email Pricing tab
+tab_parser, tab_email_pricing = st.tabs(["Parser", "Email Pricing"]) 
+with tab_parser:
+    st.caption("Parser UI is currently rendered below and will be moved into this tab in a later refactor.")
 
 
 def _build_underlyings_key(row: pd.Series) -> str:
@@ -62,6 +83,236 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ---------------------------------
+# Email Pricing tab (input scaffold)
+# ---------------------------------
+with tab_email_pricing:
+    st.subheader("Email Pricing")
+    st.caption("Enter product details to prepare a pricing email draft.")
+
+    st.markdown("Source for ticker suggestions:")
+    src_col1, src_col2 = st.columns([1, 2])
+    with src_col1:
+        ticker_source = st.radio(
+            "Ticker Source",
+            options=["Local CSV", "API (OpenFIGI/Yahoo)"],
+            index=0,
+            key="ticker_source_choice",
+            horizontal=False,
+        )
+    with src_col2:
+        local_csv_path = st.text_input(
+            "Local tickers CSV path",
+            value=st.session_state.get("local_tickers_csv", ""),
+            key="local_tickers_csv",
+            help="CSV with columns: ticker, name, (optional) exch, bbg. Example row: AAPL, Apple Inc., US, AAPL US Equity",
+        )
+        local_status = ""
+        local_df = None
+        if ticker_source == "Local CSV" and local_csv_path.strip():
+            try:
+                local_df = load_tickers_csv(local_csv_path.strip())
+                local_status = f"Loaded {len(local_df):,} tickers from CSV."
+            except Exception as e:
+                local_status = f"Failed to load CSV: {e}"
+        if local_status:
+            st.caption(local_status)
+        else:
+            if ticker_source == "Local CSV":
+                st.caption("Provide a CSV path to enable local lookup.")
+            else:
+                st.caption("OpenFIGI active" if has_openfigi_key() else "Using Yahoo fallback (no OPENFIGI_API_KEY set).")
+
+    with st.form("email_pricing_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            payoff_type = st.selectbox(
+                "Payoff Type",
+                [
+                    "Autocallable Phoenix",
+                    "Reverse Convertible",
+                    "Barrier Reverse Convertible",
+                    "Airbag",
+                    "Other",
+                ],
+                index=0,
+            )
+            currency = st.selectbox("Currency", ["CHF", "EUR", "USD", "GBP"], index=0)
+            notional = st.number_input("Notional", min_value=0.0, value=100_000.0, step=1_000.0, format="%.0f")
+            tenor_months = st.number_input("Tenor (months)", min_value=1, max_value=240, value=12, step=1)
+            observation = st.selectbox("Observation Frequency", ["Monthly", "Quarterly", "Semi-Annual", "Annual"], index=0)
+            autocallable = st.checkbox("Autocallable", value=True)
+            no_call_months = st.number_input("No-call period (months)", min_value=0, max_value=60, value=3, step=1)
+        with c2:
+            barrier_type = st.selectbox("Barrier Type", ["European", "American", "KI"], index=0)
+            barrier_level = st.number_input("Barrier Level (%)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
+            strike = st.number_input("Strike (%)", min_value=0.0, max_value=200.0, value=100.0, step=0.5)
+            coupon_target = st.number_input("Coupon (% p.a.)", min_value=0.0, max_value=100.0, value=12.0, step=0.1)
+            reoffer = st.number_input("Reoffer (%)", min_value=0.0, max_value=105.0, value=100.0, step=0.1)
+            issuer_pref = st.text_input("Preferred Issuers (comma-separated)", value="GS, UBS, BARCLAYS")
+
+        st.caption("Underlyings — start typing and pick a suggestion to autofill Bloomberg-style ticker")
+        ucols = st.columns(5)
+        underlyings: List[str] = []
+
+        def _search_cb_factory(df_local):
+            def _cb(q: str):
+                q = (q or "").strip()
+                if len(q) < 2:
+                    return []
+                if ticker_source == "Local CSV" and df_local is not None:
+                    sugg = search_local_tickers(df_local, q, limit=8)
+                else:
+                    sugg = suggest_tickers(q, limit=8)
+                labels = [f"{s['bbg']} — {s['name']}" if s.get('name') else s['bbg'] for s in sugg]
+                # stash mapping for current run; caller scope will set the right key
+                st.session_state["_last_suggestion_map"] = {labels[j]: sugg[j]["bbg"] for j in range(len(sugg))}
+                return labels
+            return _cb
+
+        for i in range(5):
+            key_val = f"ep_under_{i+1}"
+            with ucols[i]:
+                if _HAS_SEARCHBOX:
+                    placeholder = f"Underlying {i+1}"
+                    selected_label = st_searchbox(
+                        _search_cb_factory(local_df),
+                        key=f"ep_search_{i+1}",
+                        default=st.session_state.get(key_val, ""),
+                        placeholder=placeholder,
+                    )
+                    if selected_label:
+                        mapping = st.session_state.get("_last_suggestion_map", {})
+                        value = mapping.get(selected_label, selected_label)
+                        st.session_state[key_val] = value
+                else:
+                    # Fallback to text input + selectbox suggestions
+                    typed = st.text_input(f"Underlying {i+1}", key=key_val)
+                    if isinstance(typed, str) and len(typed.strip()) >= 2:
+                        q = typed.strip()
+                        if ticker_source == "Local CSV" and local_df is not None:
+                            sugg = search_local_tickers(local_df, q, limit=8)
+                        else:
+                            sugg = suggest_tickers(q, limit=8)
+                        if sugg:
+                            labels = [f"{s['bbg']} — {s['name']}" if s.get('name') else s['bbg'] for s in sugg]
+                            label_to_val = {labels[j]: sugg[j]["bbg"] for j in range(len(sugg))}
+                            pick = st.selectbox("Suggestions", options=["(keep typed)"] + labels, key=f"ep_sugg_{i+1}")
+                            if pick and pick != "(keep typed)":
+                                st.session_state[key_val] = label_to_val[pick]
+                                st.experimental_rerun()
+
+                if isinstance(st.session_state.get(key_val), str) and st.session_state[key_val].strip():
+                    underlyings.append(st.session_state[key_val].strip())
+
+        solve_for = st.selectbox("Solve For", ["Coupon", "Strike", "Barrier", "Reoffer"], index=0)
+        client_name = st.text_input("Client/Recipient Name", value="")
+        email_subject = st.text_input("Email Subject", value="Pricing Request")
+        comments = st.text_area("Comments / Instructions", value="")
+
+        prepared = st.form_submit_button("Prepare Email Preview")
+
+    if prepared:
+        # Build a simple summary table for preview
+        details = {
+            "Payoff": payoff_type,
+            "Currency": currency,
+            "Notional": f"{notional:,.0f}",
+            "Tenor (m)": int(tenor_months),
+            "Obs. Freq": observation,
+            "Autocallable": "Yes" if autocallable else "No",
+            "No-call (m)": int(no_call_months),
+            "Barrier Type": barrier_type,
+            "Barrier (%)": f"{barrier_level:.2f}",
+            "Strike (%)": f"{strike:.2f}",
+            "Coupon (% p.a.)": f"{coupon_target:.2f}",
+            "Reoffer (%)": f"{reoffer:.2f}",
+            "Preferred Issuers": issuer_pref,
+            "Underlyings": ", ".join(underlyings) if underlyings else "-",
+            "Solve For": solve_for,
+        }
+
+        # Replace the chosen solve parameter with bold SOLVE in the preview/email
+        solve_map = {
+            "Coupon": "Coupon (% p.a.)",
+            "Strike": "Strike (%)",
+            "Barrier": "Barrier (%)",
+            "Reoffer": "Reoffer (%)",
+        }
+        solve_key = solve_map.get(solve_for)
+        if solve_key and solve_key in details:
+            details[solve_key] = "<b>SOLVE</b>"
+
+        df_preview = pd.DataFrame(
+            {"Field": list(details.keys()), "Value": list(details.values())}
+        )
+        st.subheader("Email Preview")
+        st.dataframe(df_preview, use_container_width=True)
+
+        # Compose a basic HTML body, highlighting the SOLVE row
+        html_rows_parts = []
+        for k, v in details.items():
+            highlight = (k == solve_key)
+            td_style = "padding:4px 8px;border:1px solid #ddd;" + ("background-color:#fff3cd;" if highlight else "")
+            html_rows_parts.append(
+                f"<tr><td style='padding:4px 8px;border:1px solid #ddd;'><b>{k}</b></td><td style='{td_style}'>{v}</td></tr>"
+            )
+        html_rows = "".join(html_rows_parts)
+        html_table = f"""
+        <div>
+          <p>Dear {client_name or 'Recipient'},</p>
+          <p>Please find below the pricing request details:</p>
+          <table style='border-collapse:collapse;font-family:Segoe UI, Arial, sans-serif;font-size:12.5px;'>
+            {html_rows}
+          </table>
+          <p>{comments}</p>
+        </div>
+        """
+
+        st.markdown("Preview HTML body:")
+        st.code(html_table, language="html")
+        st.markdown(html_table, unsafe_allow_html=True)
+
+        # Optional: generate Outlook draft from a template or blank
+        template_path = st.text_input(
+            "Outlook template (.oft) path (optional)",
+            value=st.session_state.get(
+                "email_pricing_template_path",
+                r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\PricingRequest.oft",
+            ),
+            key="email_pricing_template_path",
+            help="If provided, the draft email will be created from this template; otherwise a blank draft is used.",
+        )
+
+        if st.button("Open Draft in Outlook", key="ep_open_outlook"):
+            try:
+                import pythoncom  # type: ignore
+                pythoncom.CoInitialize()
+                import win32com.client as win32  # type: ignore
+                outlook = win32.Dispatch("Outlook.Application")
+                mail = None
+                try:
+                    if template_path and os.path.exists(template_path):
+                        mail = outlook.CreateItemFromTemplate(template_path)
+                except Exception:
+                    mail = None
+                if mail is None:
+                    mail = outlook.CreateItem(0)  # olMailItem
+                mail.Subject = email_subject or "Pricing Request"
+                try:
+                    mail.HTMLBody = html_table + getattr(mail, "HTMLBody", "")
+                except Exception:
+                    mail.Body = df_preview.to_string(index=False) + "\n\n" + getattr(mail, "Body", "")
+                mail.Display()
+                st.success("Outlook draft opened.")
+            except Exception as e:
+                st.error(f"Failed to open Outlook draft: {e}")
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
 
 
 # Issuer abbreviation mapping for display and filtering

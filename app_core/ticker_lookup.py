@@ -8,7 +8,8 @@ import requests
 
 
 def _openfigi_search(query: str, limit: int = 10) -> List[Dict[str, str]]:
-    api_key = os.getenv("9d88f101-ee95-42fe-8604-4b2340a2777a")
+    # Expect API key in env var OPENFIGI_API_KEY; streamlit_app sets it from secrets if available
+    api_key = os.getenv("OPENFIGI_API_KEY")
     if not api_key:
         return []
     url = "https://api.openfigi.com/v3/search"
@@ -89,3 +90,10 @@ def suggest_tickers(query: str, limit: int = 10) -> List[Dict[str, str]]:
         return suggestions
     return _yahoo_search(query, limit=limit)
 
+
+def has_openfigi_key() -> bool:
+    """Return True if an OpenFIGI API key is configured in the environment.
+
+    The Streamlit app may set this from `st.secrets["OPENFIGI_API_KEY"]`.
+    """
+    return bool(os.getenv("OPENFIGI_API_KEY") and os.getenv("OPENFIGI_API_KEY").strip())

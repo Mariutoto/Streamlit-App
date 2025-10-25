@@ -1,4 +1,4 @@
-import io
+﻿import io
 import os
 from typing import Optional, List
 
@@ -17,8 +17,7 @@ from app_core.email_integration import (
     resolve_smtp,
 )
 from app_core.pipeline import run_on_html, run_outlook
-from app_core.ticker_lookup import suggest_tickers, has_openfigi_key
-from app_core.ticker_store import load_tickers_csv, search_local_tickers
+# Removed ticker lookup imports (CSV/API suggestions) per request
 
 # Optional autocomplete component
 try:
@@ -39,7 +38,7 @@ except Exception:
     pass
 
 # Top-level tabs: keep existing parser flow and add an Email Pricing tab
-tab_parser, tab_email_pricing = st.tabs(["Parser", "Email Pricing"]) 
+tab_parser, tab_email_pricing, tab_outlook = st.tabs(["Parser", "Email Pricing", "Outlook Test"]) 
 with tab_parser:
     st.caption("Parser UI is currently rendered below and will be moved into this tab in a later refactor.")
 
@@ -76,8 +75,23 @@ st.markdown(
     """
     <style>
     div.stCheckbox > label, .stCheckbox label, label[for^="checkbox"] {
-        font-size: 0.85rem !important;
-        white-space: nowrap !important;
+        font-size: 0.95rem !important;
+        white-space: normal !important;
+        line-height: 1.2rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Visual style for solved fields (red highlight)
+st.markdown(
+    """
+    <style>
+    div.solved {
+        background:#ffe6e6; border:1px solid #d9534f; color:#a94442;
+        padding:8px 10px; border-radius:6px; margin-bottom:6px;
+        font-size:0.9rem;
     }
     </style>
     """,
@@ -89,127 +103,90 @@ st.markdown(
 # ---------------------------------
 with tab_email_pricing:
     st.subheader("Email Pricing")
-    st.caption("Enter product details to prepare a pricing email draft.")
+    st.caption("Enter product details; we'll build a horizontal table email draft.")
 
-    st.markdown("Source for ticker suggestions:")
-    src_col1, src_col2 = st.columns([1, 2])
-    with src_col1:
-        ticker_source = st.radio(
-            "Ticker Source",
-            options=["Local CSV", "API (OpenFIGI/Yahoo)"],
-            index=0,
-            key="ticker_source_choice",
-            horizontal=False,
-        )
-    with src_col2:
-        local_csv_path = st.text_input(
-            "Local tickers CSV path",
-            value=st.session_state.get("local_tickers_csv", ""),
-            key="local_tickers_csv",
-            help="CSV with columns: ticker, name, (optional) exch, bbg. Example row: AAPL, Apple Inc., US, AAPL US Equity",
-        )
-        local_status = ""
-        local_df = None
-        if ticker_source == "Local CSV" and local_csv_path.strip():
-            try:
-                local_df = load_tickers_csv(local_csv_path.strip())
-                local_status = f"Loaded {len(local_df):,} tickers from CSV."
-            except Exception as e:
-                local_status = f"Failed to load CSV: {e}"
-        if local_status:
-            st.caption(local_status)
-        else:
-            if ticker_source == "Local CSV":
-                st.caption("Provide a CSV path to enable local lookup.")
-            else:
-                st.caption("OpenFIGI active" if has_openfigi_key() else "Using Yahoo fallback (no OPENFIGI_API_KEY set).")
+    # Solve For outside the form so UI reacts instantly
+    solve_for = st.selectbox(
+        "Solve For",
+        ["Coupon", "Strike", "Barrier", "Reoffer"],
+        index=0,
+        key="ep_solve_for",
+    )
 
     with st.form("email_pricing_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            payoff_type = st.selectbox(
-                "Payoff Type",
-                [
-                    "Autocallable Phoenix",
-                    "Reverse Convertible",
-                    "Barrier Reverse Convertible",
-                    "Airbag",
-                    "Other",
-                ],
-                index=0,
-            )
-            currency = st.selectbox("Currency", ["CHF", "EUR", "USD", "GBP"], index=0)
-            notional = st.number_input("Notional", min_value=0.0, value=100_000.0, step=1_000.0, format="%.0f")
-            tenor_months = st.number_input("Tenor (months)", min_value=1, max_value=240, value=12, step=1)
-            observation = st.selectbox("Observation Frequency", ["Monthly", "Quarterly", "Semi-Annual", "Annual"], index=0)
-            autocallable = st.checkbox("Autocallable", value=True)
-            no_call_months = st.number_input("No-call period (months)", min_value=0, max_value=60, value=3, step=1)
-        with c2:
-            barrier_type = st.selectbox("Barrier Type", ["European", "American", "KI"], index=0)
-            barrier_level = st.number_input("Barrier Level (%)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
-            strike = st.number_input("Strike (%)", min_value=0.0, max_value=200.0, value=100.0, step=0.5)
-            coupon_target = st.number_input("Coupon (% p.a.)", min_value=0.0, max_value=100.0, value=12.0, step=0.1)
-            reoffer = st.number_input("Reoffer (%)", min_value=0.0, max_value=105.0, value=100.0, step=0.1)
-            issuer_pref = st.text_input("Preferred Issuers (comma-separated)", value="GS, UBS, BARCLAYS")
+        # Use the value chosen above during this form render
+        solve_for = st.session_state.get("ep_solve_for", "Coupon")
 
-        st.caption("Underlyings — start typing and pick a suggestion to autofill Bloomberg-style ticker")
+        # Product + key toggles at the top
+        payoff_type = st.selectbox(
+            "Payoff Type",
+            [
+                "Autocallable Phoenix",
+                "Reverse Convertible",
+                "Barrier Reverse Convertible",
+                "Airbag",
+                "Other",
+            ],
+            index=0,
+        )
+        autocallable = st.checkbox("Autocallable", value=True)
+
+        # Pairs: Notional | Currency
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            notional = st.number_input("Notional", min_value=0.0, value=100_000.0, step=1_000.0, format="%.0f")
+        with r1c2:
+            currency = st.selectbox("Currency", ["CHF", "EUR", "USD", "GBP"], index=0)
+
+        # Pairs: Barrier Type | Barrier Level
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            barrier_type = st.selectbox("Barrier Type", ["European", "American", "KI"], index=0)
+        with r2c2:
+            if solve_for == "Barrier":
+                st.markdown("<div class='solved'>Barrier Level (%) — Solved (leave blank)</div>", unsafe_allow_html=True)
+                barrier_level = st.session_state.get("barrier_level", 60.0)
+            else:
+                barrier_level = st.number_input("Barrier Level (%)", min_value=0.0, max_value=100.0, value=60.0, step=0.5)
+
+        # Pairs: Tenor | Observation Frequency
+        r3c1, r3c2 = st.columns(2)
+        with r3c1:
+            tenor_months = st.number_input("Tenor (months)", min_value=1, max_value=240, value=12, step=1)
+        with r3c2:
+            observation = st.selectbox("Observation Frequency", ["Monthly", "Quarterly", "Semi-Annual", "Annual"], index=0)
+
+        # Additional toggles/values
+        no_call_months = st.number_input("No-call period (months)", min_value=0, max_value=60, value=3, step=1)
+        # Strike
+        if solve_for == "Strike":
+            st.markdown("<div class='solved'>Strike (%) — Solved (leave blank)</div>", unsafe_allow_html=True)
+            strike = st.session_state.get("strike", 100.0)
+        else:
+            strike = st.number_input("Strike (%)", min_value=0.0, max_value=200.0, value=100.0, step=0.5)
+        # Coupon
+        if solve_for == "Coupon":
+            st.markdown("<div class='solved'>Coupon (% p.a.) — Solved (leave blank)</div>", unsafe_allow_html=True)
+            coupon_target = st.session_state.get("coupon_target", 12.0)
+        else:
+            coupon_target = st.number_input("Coupon (% p.a.)", min_value=0.0, max_value=100.0, value=12.0, step=0.1)
+        # Reoffer
+        if solve_for == "Reoffer":
+            st.markdown("<div class='solved'>Reoffer (%) — Solved (leave blank)</div>", unsafe_allow_html=True)
+            reoffer = st.session_state.get("reoffer", 100.0)
+        else:
+            reoffer = st.number_input("Reoffer (%)", min_value=0.0, max_value=105.0, value=100.0, step=0.1)
+
+        st.caption("Underlyings (Bloomberg codes), one per column")
         ucols = st.columns(5)
         underlyings: List[str] = []
-
-        def _search_cb_factory(df_local):
-            def _cb(q: str):
-                q = (q or "").strip()
-                if len(q) < 2:
-                    return []
-                if ticker_source == "Local CSV" and df_local is not None:
-                    sugg = search_local_tickers(df_local, q, limit=8)
-                else:
-                    sugg = suggest_tickers(q, limit=8)
-                labels = [f"{s['bbg']} — {s['name']}" if s.get('name') else s['bbg'] for s in sugg]
-                # stash mapping for current run; caller scope will set the right key
-                st.session_state["_last_suggestion_map"] = {labels[j]: sugg[j]["bbg"] for j in range(len(sugg))}
-                return labels
-            return _cb
-
         for i in range(5):
             key_val = f"ep_under_{i+1}"
             with ucols[i]:
-                if _HAS_SEARCHBOX:
-                    placeholder = f"Underlying {i+1}"
-                    selected_label = st_searchbox(
-                        _search_cb_factory(local_df),
-                        key=f"ep_search_{i+1}",
-                        default=st.session_state.get(key_val, ""),
-                        placeholder=placeholder,
-                    )
-                    if selected_label:
-                        mapping = st.session_state.get("_last_suggestion_map", {})
-                        value = mapping.get(selected_label, selected_label)
-                        st.session_state[key_val] = value
-                else:
-                    # Fallback to text input + selectbox suggestions
-                    typed = st.text_input(f"Underlying {i+1}", key=key_val)
-                    if isinstance(typed, str) and len(typed.strip()) >= 2:
-                        q = typed.strip()
-                        if ticker_source == "Local CSV" and local_df is not None:
-                            sugg = search_local_tickers(local_df, q, limit=8)
-                        else:
-                            sugg = suggest_tickers(q, limit=8)
-                        if sugg:
-                            labels = [f"{s['bbg']} — {s['name']}" if s.get('name') else s['bbg'] for s in sugg]
-                            label_to_val = {labels[j]: sugg[j]["bbg"] for j in range(len(sugg))}
-                            pick = st.selectbox("Suggestions", options=["(keep typed)"] + labels, key=f"ep_sugg_{i+1}")
-                            if pick and pick != "(keep typed)":
-                                st.session_state[key_val] = label_to_val[pick]
-                                st.experimental_rerun()
+                val = st.text_input(f"Underlying {i+1}", key=key_val)
+                if isinstance(val, str) and val.strip():
+                    underlyings.append(val.strip())
 
-                if isinstance(st.session_state.get(key_val), str) and st.session_state[key_val].strip():
-                    underlyings.append(st.session_state[key_val].strip())
-
-        solve_for = st.selectbox("Solve For", ["Coupon", "Strike", "Barrier", "Reoffer"], index=0)
-        client_name = st.text_input("Client/Recipient Name", value="")
-        email_subject = st.text_input("Email Subject", value="Pricing Request")
-        comments = st.text_area("Comments / Instructions", value="")
 
         prepared = st.form_submit_button("Prepare Email Preview")
 
@@ -228,7 +205,7 @@ with tab_email_pricing:
             "Strike (%)": f"{strike:.2f}",
             "Coupon (% p.a.)": f"{coupon_target:.2f}",
             "Reoffer (%)": f"{reoffer:.2f}",
-            "Preferred Issuers": issuer_pref,
+            # Preferred Issuers removed per request
             "Underlyings": ", ".join(underlyings) if underlyings else "-",
             "Solve For": solve_for,
         }
@@ -244,70 +221,154 @@ with tab_email_pricing:
         if solve_key and solve_key in details:
             details[solve_key] = "<b>SOLVE</b>"
 
-        df_preview = pd.DataFrame(
-            {"Field": list(details.keys()), "Value": list(details.values())}
-        )
+        df_preview = pd.DataFrame({"Field": list(details.keys()), "Value": list(details.values())})
         st.subheader("Email Preview")
         st.dataframe(df_preview, use_container_width=True)
 
-        # Compose a basic HTML body, highlighting the SOLVE row
-        html_rows_parts = []
-        for k, v in details.items():
-            highlight = (k == solve_key)
-            td_style = "padding:4px 8px;border:1px solid #ddd;" + ("background-color:#fff3cd;" if highlight else "")
-            html_rows_parts.append(
-                f"<tr><td style='padding:4px 8px;border:1px solid #ddd;'><b>{k}</b></td><td style='{td_style}'>{v}</td></tr>"
+        # Compose HTML body as a horizontal one-row table using your template headers
+        col_order = [
+            "Product",
+            "Currency",
+            "Size",
+            "BBG Code 1",
+            "BBG Code 2",
+            "BBG Code 3",
+            "BBG Code 4",
+            "BBG Code 5",
+            "Reoffer (%)",
+            "Tenor (m)",
+            "Frequency",
+            "Autocall From Period",
+            "Autocall Level (%)",
+            "Memory Coupon",
+            "Coupon Barrier (%)",
+            "Coupon p.a. (%)",
+            "Barrier Type",
+            "KI Barrier (%)",
+            "Put Strike (%)",
+            "Gearing (%)",
+            "Strike Date",
+        ]
+
+        # Map our form values to these headers; leave unknown fields blank
+        # Underlyings -> BBG Code 1..5
+        u_vals = underlyings + [""] * (5 - len(underlyings))
+        # Derive simple defaults for fields we don't collect
+        derived_memory_coupon = "Guaranteed" if autocallable else "None"
+        derived_autocall_lvl = "100.00" if autocallable else ""
+        derived_coupon_barrier = "0.00"  # not collected; set 0
+
+        value_map = {
+            "Product": payoff_type,
+            "Currency": currency,
+            "Size": f"{notional:,.0f}",
+            "BBG Code 1": u_vals[0],
+            "BBG Code 2": u_vals[1],
+            "BBG Code 3": u_vals[2],
+            "BBG Code 4": u_vals[3],
+            "BBG Code 5": u_vals[4],
+            "Reoffer (%)": f"{reoffer:.2f}",
+            "Tenor (m)": int(tenor_months),
+            "Frequency": observation,
+            "Autocall From Period": int(no_call_months),
+            "Autocall Level (%)": derived_autocall_lvl,
+            "Memory Coupon": derived_memory_coupon,
+            "Coupon Barrier (%)": derived_coupon_barrier,
+            "Coupon p.a. (%)": f"{coupon_target:.2f}",
+            "Barrier Type": barrier_type,
+            "KI Barrier (%)": f"{barrier_level:.2f}",
+            "Put Strike (%)": "",  # not collected
+            "Gearing (%)": "",      # not collected
+            "Strike Date": "",      # not collected
+        }
+
+        # If solving for a field, leave it blank in the output
+        if solve_for == "Coupon":
+            value_map["Coupon p.a. (%)"] = ""
+        elif solve_for == "Strike":
+            value_map["Put Strike (%)"] = ""
+        elif solve_for == "Barrier":
+            value_map["KI Barrier (%)"] = ""
+        elif solve_for == "Reoffer":
+            value_map["Reoffer (%)"] = ""
+
+        # Horizontal table builder
+        th_style = "padding:6px 10px;border:1px solid #ddd;background:#F2F2F2;white-space:nowrap;"
+        td_base = "padding:6px 10px;border:1px solid #ddd;white-space:nowrap;"
+        horiz_header = "".join([f"<th style='{th_style}'>{h}</th>" for h in col_order])
+        horiz_cells = []
+        for h in col_order:
+            val = value_map.get(h, "")
+            # Highlight solved field
+            is_solve = (
+                (solve_for == "Coupon" and h == "Coupon p.a. (%)") or
+                (solve_for == "Strike" and h == "Put Strike (%)") or
+                (solve_for == "Barrier" and h == "KI Barrier (%)") or
+                (solve_for == "Reoffer" and h == "Reoffer (%)")
             )
-        html_rows = "".join(html_rows_parts)
-        html_table = f"""
+            td_style = td_base + ("background-color:#fff3cd;" if is_solve else "")
+            horiz_cells.append(f"<td style='{td_style}'>{val}</td>")
+        horiz_row = "".join(horiz_cells)
+        html_table_horizontal = f"""
         <div>
-          <p>Dear {client_name or 'Recipient'},</p>
-          <p>Please find below the pricing request details:</p>
+          <p>Please price the following:</p>
           <table style='border-collapse:collapse;font-family:Segoe UI, Arial, sans-serif;font-size:12.5px;'>
-            {html_rows}
+            <thead><tr>{horiz_header}</tr></thead>
+            <tbody><tr>{horiz_row}</tr></tbody>
           </table>
-          <p>{comments}</p>
         </div>
         """
+        st.markdown(html_table_horizontal, unsafe_allow_html=True)
+        # Persist for later button clicks across reruns
+        st.session_state["pricing_email_html"] = html_table_horizontal
+        st.session_state["pricing_email_subject"] = "Pricing Request"
 
-        st.markdown("Preview HTML body:")
-        st.code(html_table, language="html")
-        st.markdown(html_table, unsafe_allow_html=True)
-
-        # Optional: generate Outlook draft from a template or blank
-        template_path = st.text_input(
-            "Outlook template (.oft) path (optional)",
-            value=st.session_state.get(
-                "email_pricing_template_path",
-                r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\PricingRequest.oft",
-            ),
-            key="email_pricing_template_path",
-            help="If provided, the draft email will be created from this template; otherwise a blank draft is used.",
-        )
-
+    # Actions outside the form so buttons don’t depend on the form submit state
+    st.divider()
+    st.caption("Actions")
+    colA, colB = st.columns([1,1])
+    with colA:
         if st.button("Open Draft in Outlook", key="ep_open_outlook"):
+            try:
+                html_body = st.session_state.get("pricing_email_html")
+                subject = st.session_state.get("pricing_email_subject", "Pricing Request")
+                if not html_body:
+                    st.warning("Prepare Email Preview first to generate the body.")
+                else:
+                    import pythoncom  # type: ignore
+                    pythoncom.CoInitialize()
+                    import win32com.client as win32  # type: ignore
+                    outlook = win32.Dispatch("Outlook.Application")
+                    mail = outlook.CreateItem(0)  # olMailItem
+                    mail.Subject = subject
+                    try:
+                        mail.BodyFormat = 2  # olFormatHTML
+                    except Exception:
+                        pass
+                    mail.HTMLBody = html_body + getattr(mail, "HTMLBody", "")
+                    mail.Display()
+                    st.success("Outlook draft opened.")
+            except Exception as e:
+                st.exception(e)
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+    with colB:
+        if st.button("Open Blank Outlook Email", key="ep_test_outlook_inline"):
             try:
                 import pythoncom  # type: ignore
                 pythoncom.CoInitialize()
                 import win32com.client as win32  # type: ignore
                 outlook = win32.Dispatch("Outlook.Application")
-                mail = None
-                try:
-                    if template_path and os.path.exists(template_path):
-                        mail = outlook.CreateItemFromTemplate(template_path)
-                except Exception:
-                    mail = None
-                if mail is None:
-                    mail = outlook.CreateItem(0)  # olMailItem
-                mail.Subject = email_subject or "Pricing Request"
-                try:
-                    mail.HTMLBody = html_table + getattr(mail, "HTMLBody", "")
-                except Exception:
-                    mail.Body = df_preview.to_string(index=False) + "\n\n" + getattr(mail, "Body", "")
+                mail = outlook.CreateItem(0)
+                mail.Subject = ""
+                mail.Body = ""
                 mail.Display()
-                st.success("Outlook draft opened.")
+                st.success("Blank Outlook email opened.")
             except Exception as e:
-                st.error(f"Failed to open Outlook draft: {e}")
+                st.exception(e)
             finally:
                 try:
                     pythoncom.CoUninitialize()
@@ -576,109 +637,139 @@ with st.sidebar:
     issuer_override = issuer_override or None
 
 
-start = st.button("Start Parsing")
+with tab_parser:
+    st.subheader("Parser")
+    start = st.button("Start Parsing", key="start_parsing_btn")
 
-if start:
-    df_all = run_outlook(mailbox, [p for p in folder_path.split('/') if p], max_emails=n)
-    if df_all is None or df_all.empty:
-        st.warning("No data parsed from Outlook.")
-    else:
-        st.success(f"Parsed {len(df_all)} rows from Outlook.")
-        st.session_state["df_all"] = df_all
+    if start:
+        result = run_outlook(mailbox, [p for p in folder_path.split('/') if p], max_emails=n)
+        # Support both new (df, stats) and old (df) return signatures
+        if isinstance(result, tuple) and len(result) == 2:
+            df_all, stats = result
+        else:
+            df_all, stats = result, {"retrieved_emails": n, "parsed_emails": 0, "parsed_rows": len(result) if hasattr(result, "__len__") else 0}
 
-
-df_all = st.session_state.get("df_all")
-
-if isinstance(df_all, pd.DataFrame) and not df_all.empty:
-    st.subheader("Select Versions")
-
-    # Variable to solve for
-    possible_vars = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all.columns]
-    solve_var = st.selectbox("Select variable you are solving for:", options=possible_vars, index=0)
-
-    # Key components
-    st.caption("Select Key Components:")
-    comp_default = {
-        "underlyings": True,
-        "tenor": True,
-        "barrier_type": True,
-        "barrier": True,
-        "no_call_period": True,
-        "strike": True,
-        "coupon": True,
-        "reoffer": True,
-    }
-
-    comp_names = list(comp_default.keys())
-    cols = st.columns(len(comp_names))
-    components = []
-    selected_labels = []
-    for i, name in enumerate(comp_names):
-        label = name.replace("_", " ").capitalize()
-        disabled = name == solve_var
-        checked = comp_default[name] and not disabled
-        val = cols[i].checkbox(label, value=checked, disabled=disabled)
-        if val:
-            components.append(name)
-            selected_labels.append(label)
-
-    st.caption("Current key: " + " + ".join(selected_labels) if components else "Current key: (none)")
-
-    # — Choose versions just below key components —
-    # Build grouping based on selected key for preview/selection
-    df_view_for_versions = df_all.copy()
-    version_key_series = _make_key(df_view_for_versions, components)
-    df_view_for_versions = df_view_for_versions.assign(_version_key=version_key_series)
-
-    # Implicit sorting rule based on solve variable
-    asc = False if solve_var == "coupon" else True
-
-    # Aggregate per version: count + issuer list (abbreviations)
-    grp = (
-        df_view_for_versions.groupby("_version_key")
-        .agg(
-            rows=(solve_var, "size"),
-            issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
-            issuer_list=(
-                "issuer",
-                lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })
-            ),
-            metric=(solve_var, "mean"),
+        if df_all is None or df_all.empty:
+            st.warning("No data parsed from Outlook.")
+        else:
+            # Store results silently (no green success banner per request)
+            st.session_state["df_all"] = df_all
+        # Always show processing stats for clarity
+        st.caption(
+            f"Processed {stats.get('retrieved_emails', 0)} emails • Parsed {stats.get('parsed_emails', 0)} emails • Parsed data rows {stats.get('parsed_rows', 0)}"
         )
-        .reset_index()
-        .sort_values(by=["metric"], ascending=asc)
-    )
+
+
+    df_all = st.session_state.get("df_all")
+
+    if not isinstance(df_all, pd.DataFrame) or df_all.empty:
+        st.info("Provide input and click Start Parsing to begin.")
+    else:
+        st.subheader("Select Versions")
+
+        # Variable to solve for
+        possible_vars = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all.columns]
+        solve_var = st.selectbox("Select variable you are solving for:", options=possible_vars, index=0)
+
+        # Key components
+        st.caption("Select Key Components:")
+        label_map = {
+            "underlyings": "Underlyings",
+            "tenor": "Tenor",
+            "barrier_type": "Barrier type",
+            "barrier": "Barrier",
+            "no_call_period": "No call period",
+            "strike": "Strike",
+            "coupon": "Coupon",
+            "reoffer": "Reoffer",
+        }
+        help_map = {
+            "underlyings": "Group by the underlying basket (codes 1..5)",
+            "tenor": "Tenor in months",
+            "barrier_type": "European/American",
+            "barrier": "Barrier level (%)",
+            "no_call_period": "Autocall from period (months)",
+            "strike": "Put strike (%)",
+            "coupon": "Coupon % p.a.",
+            "reoffer": "Reoffer (%)",
+        }
+        comp_order = [
+            "underlyings", "tenor", "barrier_type", "barrier",
+            "no_call_period", "strike", "coupon", "reoffer",
+        ]
+        # Default selections: everything except Reoffer
+        comp_default = {k: True for k in comp_order}
+        comp_default["reoffer"] = False
+        components, selected_labels = [], []
+        # Render as a neat 4x2 grid
+        per_row = 4
+        for row_start in range(0, len(comp_order), per_row):
+            row_items = comp_order[row_start:row_start+per_row]
+            ccols = st.columns(len(row_items))
+            for j, name in enumerate(row_items):
+                label = label_map[name]
+                disabled = (name == solve_var)
+                checked = comp_default[name] and not disabled
+                with ccols[j]:
+                    val = st.checkbox(label, value=checked, disabled=disabled, help=help_map.get(name))
+                if val:
+                    components.append(name)
+                    selected_labels.append(label)
+
+        st.caption("Current key: " + " + ".join(selected_labels) if components else "Current key: (none)")
+
+        # Build grouping based on selected key for preview/selection
+        def _get_version_labels_and_map(df: pd.DataFrame, components: list[str], solve_var: str):
+            tmp = df.copy()
+            tmp = tmp.assign(_version_key=_make_key(tmp, components))
+            asc_local = False if solve_var == "coupon" else True
+            grp = (
+                tmp.groupby("_version_key")
+                .agg(
+                    rows=(solve_var, "size"),
+                    issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
+                    issuer_list=(
+                        "issuer",
+                        lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })
+                    ),
+                    metric=(solve_var, "mean"),
+                )
+                .reset_index()
+                .sort_values(by=["metric"], ascending=asc_local)
+            )
+            recs = grp.to_dict("records")
+            def _label(rec: dict) -> str:
+                key = rec.get("_version_key", "")
+                key_disp = _bold_text(str(key))
+                cnt = int(rec.get("issuers", 0))
+                ilist = list(rec.get("issuer_list", []))
+                if len(ilist) > 10:
+                    ilist = ilist[:10] + [f"+{len(ilist)-10}"]
+                issuers_txt = ", ".join(ilist) if ilist else "-"
+                return f"{key_disp} ({cnt} issuers: {issuers_txt})"
+            labels = [_label(r) for r in recs]
+            vmap = {lab: r.get("_version_key", "") for lab, r in zip(labels, recs)}
+            return labels, vmap, recs
+
+        version_labels, version_map, recs_internal = _get_version_labels_and_map(df_all, components, solve_var)
+
+    # If no data yet, halt rendering of the rest of the section
+    if not (isinstance(df_all, pd.DataFrame) and not df_all.empty):
+        st.stop()
 
     mode = st.radio("Mode:", options=["Single version", "Compare versions"], index=0)
 
-    # Build readable labels that also include issuer abbreviations (truncated)
-    def _label_with_issuers(row):
-        key = row["_version_key"]
-        key_disp = _bold_text(str(key))  # make key visually bold in dropdown
-        cnt = int(row.get("issuers", 0))
-        ilist = list(row.get("issuer_list", []))
-        max_show = 10
-        shown = ilist[:max_show]
-        suffix = "" if len(ilist) <= max_show else f" +{len(ilist) - max_show}"
-        issuers_txt = ", ".join(shown) if shown else "-"
-        return f"{key_disp} ({cnt} issuers: {issuers_txt}{suffix})"
-
-    version_labels = [_label_with_issuers(row) for _, row in grp.iterrows()]
-    version_map = {label: row["_version_key"] for label, (_, row) in zip(version_labels, grp.iterrows())}
+    # Ensure defaults without triggering Streamlit magic output
+    version_labels = locals().get("version_labels", [])
+    version_map = locals().get("version_map", {})
 
     if mode == "Single version":
         selected_label = st.selectbox(
             "Choose version",
-            options=version_labels,
+            options=(version_labels or ["(no versions)"]),
             help="Labels show the version key plus the issuers included (hover to read full label).",
         )
         selected_versions = [version_map[selected_label]] if version_labels else []
-        # Show issuers for the currently selected version
-        if selected_label:
-            row = next((r for l, (_, r) in zip(version_labels, grp.iterrows()) if l == selected_label), None)
-            if row is not None:
-                ilist = list(row.get("issuer_list", []))
-                st.caption("Issuers in selected version: " + (", ".join(ilist) if ilist else "-"))
     else:
         selected_labels_multi = st.multiselect(
             "Choose versions",
@@ -691,31 +782,32 @@ if isinstance(df_all, pd.DataFrame) and not df_all.empty:
         if selected_labels_multi:
             items = []
             for idx, lab in enumerate(selected_labels_multi, start=1):
-                row = next((r for l, (_, r) in zip(version_labels, grp.iterrows()) if l == lab), None)
-                ilist = list(row.get("issuer_list", [])) if row is not None else []
+                rec = None
+                try:
+                    for l, r in zip(version_labels, recs_internal):
+                        if l == lab:
+                            rec = r
+                            break
+                except Exception:
+                    rec = None
+                ilist = list(rec.get("issuer_list", [])) if rec is not None else []
                 items.append(f"V{idx}: {', '.join(ilist) if ilist else '-'}")
             st.caption("Issuers per selected version → " + " | ".join(items))
 
-    # Issuer filter and grouping preview
-    # Build uppercase abbreviation list for issuer filter
-    if "issuer" in df_all.columns:
-        issuers_raw = [str(x) for x in df_all["issuer"].dropna().unique()]
-        issuers_display = sorted({_abbr(x) for x in issuers_raw})
-    else:
-        issuers_display = []
-    issuer_sel = st.multiselect("Filter issuers (optional)", options=issuers_display, default=issuers_display)
-
+    # Minimal UI: no issuer filter; use full dataset
     df_view = df_all.copy()
-    if issuer_sel:
-        df_view = df_view[df_view["issuer"].apply(lambda x: _abbr(x) in set(issuer_sel))]
 
     # Recompute key on filtered view for final output
     key_series = _make_key(df_view, components)
     df_view = df_view.assign(_version_key=key_series)
 
     if st.button("Confirm Selection"):
-        out = df_view[df_view["_version_key"].isin(selected_versions)].copy()
-        out = out.sort_values(by=[solve_var], ascending=asc)
+        out = df_view[df_view["_version_key"].isin(selected_versions)].copy() if selected_versions else df_view.copy()
+        # Determine sort direction: coupon desc, others asc
+        _metric = (solve_var or "coupon").lower()
+        asc = False if _metric == "coupon" else True
+        if solve_var in out.columns:
+            out = out.sort_values(by=[solve_var], ascending=asc)
         # Replace issuer names by uppercase abbreviations and display NA
         if "issuer" in out.columns:
             out["issuer"] = out["issuer"].apply(_abbr)
@@ -736,78 +828,129 @@ if isinstance(df_all, pd.DataFrame) and not df_all.empty:
         # Result and email are shown in the Confirmed section below
 
     # Persistent actions area: reused after any rerun
-    if st.session_state.get("confirmed") and isinstance(st.session_state.get("confirmed_out_display"), pd.DataFrame):
-        out = st.session_state["confirmed_out"]
-        out_display = st.session_state["confirmed_out_display"]
+        if st.session_state.get("confirmed") and isinstance(st.session_state.get("confirmed_out_display"), pd.DataFrame):
+            out = st.session_state["confirmed_out"]
+            out_display = st.session_state["confirmed_out_display"]
 
-        st.subheader("Result Table (Confirmed)")
-        # Show issuer table: single or compare mode
-        confirmed_solve_var = st.session_state.get("confirmed_solve_var", "coupon")
-        confirmed_mode = st.session_state.get("confirmed_mode", "Single version")
-        if confirmed_mode == "Compare versions":
-            versions = st.session_state.get("confirmed_versions", [])
-            titles = st.session_state.get("confirmed_version_titles", [])
-            issuer_table_df = _build_issuer_compare_table_df(out, confirmed_solve_var, versions, titles)
-        else:
-            issuer_table_df = _build_issuer_table_df(out, confirmed_solve_var)
-        st.dataframe(issuer_table_df, use_container_width=True)
-        csv_persist = issuer_table_df.to_csv(index=False).encode("utf-8")
-        file_metric = ("coupon" if confirmed_solve_var == "coupon" else confirmed_solve_var.title())
-        st.download_button(
-            "Download CSV (Confirmed)",
-            data=csv_persist,
-            file_name=f"issuer_rating_{file_metric}.csv",
-            mime="text/csv",
-            key="dl_csv_confirmed",
-        )
+            st.subheader("Result Table (Confirmed)")
+            # Show issuer table: single or compare mode
+            confirmed_solve_var = st.session_state.get("confirmed_solve_var", "coupon")
+            confirmed_mode = st.session_state.get("confirmed_mode", "Single version")
+            if confirmed_mode == "Compare versions":
+                versions = st.session_state.get("confirmed_versions", [])
+                titles = st.session_state.get("confirmed_version_titles", [])
+                issuer_table_df = _build_issuer_compare_table_df(out, confirmed_solve_var, versions, titles)
+            else:
+                issuer_table_df = _build_issuer_table_df(out, confirmed_solve_var)
+            st.dataframe(issuer_table_df, use_container_width=True)
+            csv_persist = issuer_table_df.to_csv(index=False).encode("utf-8")
+            file_metric = ("coupon" if confirmed_solve_var == "coupon" else confirmed_solve_var.title())
+            st.download_button(
+                "Download CSV (Confirmed)",
+                data=csv_persist,
+                file_name=f"issuer_rating_{file_metric}.csv",
+                mime="text/csv",
+                key="dl_csv_confirmed",
+            )
 
-        st.subheader("Email Output")
-        template_path = st.text_input(
-            "Outlook template (.oft) path",
-            value=st.session_state.get(
-                "template_path",
-                r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\Issuers.oft",
-            ),
-            key="template_path",
-            help="Provide the .oft template used to compose the email",
-        )
+            st.subheader("Email Output")
+            template_path = st.text_input(
+                "Outlook template (.oft) path",
+                value=st.session_state.get(
+                    "template_path",
+                    r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\Issuers.oft",
+                ),
+                key="template_path",
+                help="Provide the .oft template used to compose the email",
+            )
 
-        # Single action: generate Outlook email with the issuer table for the selected metric
-        if st.button("Generate Outlook Email", key="gen_email_btn"):
+            # Single action: generate Outlook email with the issuer table for the selected metric
+            if st.button("Generate Outlook Email", key="gen_email_btn"):
+                try:
+                    import os
+                    if not os.path.exists(template_path):
+                        raise FileNotFoundError(f"Template not found: {template_path}")
+                    import pythoncom  # type: ignore
+                    pythoncom.CoInitialize()
+                    import win32com.client as win32  # type: ignore
+                    outlook = win32.Dispatch("Outlook.Application")
+                    mail = outlook.CreateItemFromTemplate(template_path)
+                    html_table = issuer_table_df.to_html(index=False)
+                    try:
+                        mail.HTMLBody = f"<div>{html_table}</div>" + mail.HTMLBody
+                    except Exception:
+                        # Fallback to plain text
+                        mail.Body = issuer_table_df.to_csv(index=False) + "\n\n" + getattr(mail, "Body", "")
+                    mail.Display()
+                    st.success("Outlook email window opened from template.")
+                except Exception as e:
+                    st.error(f"Failed to generate Outlook email: {e}")
+                finally:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+            # Show the full selection table after the confirmed issuer table
+            st.subheader(f"Result Table (Solved for {confirmed_solve_var})")
+            st.dataframe(out_display, use_container_width=True)
+            csv_full = out_display.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Full CSV",
+                data=csv_full,
+                file_name="parsed_selection.csv",
+                mime="text/csv",
+                key="dl_csv_full_confirmed",
+            )
+
+            # Debug table B: all rows across all versions, grouped by current key, sorted by issuer then version
             try:
-                import os
-                if not os.path.exists(template_path):
-                    raise FileNotFoundError(f"Template not found: {template_path}")
-                import pythoncom  # type: ignore
-                pythoncom.CoInitialize()
-                import win32com.client as win32  # type: ignore
-                outlook = win32.Dispatch("Outlook.Application")
-                mail = outlook.CreateItemFromTemplate(template_path)
-                html_table = issuer_table_df.to_html(index=False)
-                try:
-                    mail.HTMLBody = f"<div>{html_table}</div>" + mail.HTMLBody
-                except Exception:
-                    # Fallback to plain text
-                    mail.Body = issuer_table_df.to_csv(index=False) + "\n\n" + getattr(mail, "Body", "")
-                mail.Display()
-                st.success("Outlook email window opened from template.")
-            except Exception as e:
-                st.error(f"Failed to generate Outlook email: {e}")
-            finally:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-        # Show the full selection table after the confirmed issuer table
-        st.subheader(f"Result Table (Solved for {confirmed_solve_var})")
-        st.dataframe(out_display, use_container_width=True)
-        csv_full = out_display.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Full CSV",
-            data=csv_full,
-            file_name="parsed_selection.csv",
-            mime="text/csv",
-            key="dl_csv_full_confirmed",
-        )
-else:
-    st.info("Provide input and click Start Parsing to begin.")
+                df_all_dbg = df_all.copy()
+                # Attach the current version key using the selected components
+                df_all_dbg = df_all_dbg.assign(_version_key=_make_key(df_all_dbg, components))
+                if "issuer" in df_all_dbg.columns:
+                    df_all_dbg["issuer"] = df_all_dbg["issuer"].apply(_abbr)
+                sort_cols = []
+                sort_asc = []
+                if "issuer" in df_all_dbg.columns:
+                    sort_cols.append("issuer"); sort_asc.append(True)
+                if "_version_key" in df_all_dbg.columns:
+                    sort_cols.append("_version_key"); sort_asc.append(True)
+                if confirmed_solve_var in df_all_dbg.columns:
+                    sort_cols.append(confirmed_solve_var)
+                    sort_asc.append(False if confirmed_solve_var == "coupon" else True)
+                if sort_cols:
+                    df_all_dbg = df_all_dbg.sort_values(by=sort_cols, ascending=sort_asc, na_position="last")
+                df_all_dbg_display = df_all_dbg.where(df_all_dbg.notna(), "NA")
+                st.subheader("Debug Table — All Versions (rows by issuer and version)")
+                st.dataframe(df_all_dbg_display, use_container_width=True)
+                st.download_button(
+                    "Download Debug (All Versions)",
+                    data=df_all_dbg_display.to_csv(index=False).encode("utf-8"),
+                    file_name="debug_all_versions_rows_by_issuer.csv",
+                    mime="text/csv",
+                    key="dl_csv_debug_all",
+                )
+            except Exception:
+                pass
+
+with tab_outlook:
+    st.subheader("Outlook Test")
+    st.caption("Click to open a new empty Outlook email. If nothing opens, a detailed error will be shown below.")
+    if st.button("Open Blank Outlook Email", key="blank_outlook_btn"):
+        try:
+            import pythoncom  # type: ignore
+            pythoncom.CoInitialize()
+            import win32com.client as win32  # type: ignore
+            outlook = win32.Dispatch("Outlook.Application")
+            mail = outlook.CreateItem(0)  # olMailItem
+            mail.Subject = ""
+            mail.Body = ""
+            mail.Display()
+            st.success("Opened a new blank Outlook email.")
+        except Exception as e:
+            st.exception(e)
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass

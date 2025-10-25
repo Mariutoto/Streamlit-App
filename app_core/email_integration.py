@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 from bs4 import BeautifulSoup
+import time
 
 
 def _safe_import_outlook():
@@ -20,12 +21,60 @@ def get_outlook_folder(mailbox: str, path: List[str]):
     win32 = _safe_import_outlook()
     if not win32:
         return None
-    ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
-    store = ns.Stores[mailbox]
-    root = store.GetRootFolder()
+    # Try to use EnsureDispatch for better COM marshaling
+    try:
+        app = win32.gencache.EnsureDispatch("Outlook.Application")  # type: ignore
+    except Exception:
+        app = win32.Dispatch("Outlook.Application")  # type: ignore
+
+    # Helper: retry on RPC_E_CALL_REJECTED (Outlook busy / modal dialog)
+    def _retry_call(fn, *args, **kwargs):
+        last_err = None
+        for i in range(8):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:  # pywintypes.com_error likely
+                hr = getattr(e, "hresult", None)
+                msg = str(e)
+                # -2147418111 == 0x80010001 (RPC_E_CALL_REJECTED)
+                if hr in (-2147418111, -2147023170) or "rejected" in msg.lower():
+                    time.sleep(0.4 * (i + 1))
+                    last_err = e
+                    continue
+                raise
+        # Give up after retries
+        raise last_err if last_err else RuntimeError("Outlook call failed after retries")
+
+    ns = _retry_call(app.GetNamespace, "MAPI")
+
+    # Resolve mailbox: allow display name or SMTP, case-insensitive contains
+    store = None
+    try:
+        # Direct indexer by name sometimes works
+        store = ns.Stores[mailbox]
+    except Exception:
+        # Fallback: scan stores by DisplayName
+        try:
+            count = ns.Stores.Count
+        except Exception:
+            count = 0
+        mbox_l = (mailbox or "").lower()
+        for i in range(1, count + 1):  # Outlook collections are 1-based
+            try:
+                st = ns.Stores.Item(i)
+                name = str(getattr(st, "DisplayName", ""))
+                if mbox_l and mbox_l in name.lower():
+                    store = st
+                    break
+            except Exception:
+                continue
+    if store is None:
+        return None
+
+    root = _retry_call(store.GetRootFolder)
     folder = root
     for name in path:
-        folder = folder.Folders[name]
+        folder = _retry_call(folder.Folders.__getitem__, name)
     return folder
 
 
@@ -75,4 +124,3 @@ def resolve_smtp(msg) -> Optional[str]:
         return (msg.SenderEmailAddress or "").lower()
     except Exception:
         return None
-

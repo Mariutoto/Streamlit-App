@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
 import pandas as pd
 
 from .extractors import extract_for_sender
@@ -21,7 +21,11 @@ def run_on_html(html: str, sender: Optional[str] = None, issuer_override: Option
     return normalize(df_raw, issuer)
 
 
-def run_outlook(mailbox: str, folder_path: List[str], max_emails: int = 40) -> pd.DataFrame | None:
+def run_outlook(
+    mailbox: str,
+    folder_path: List[str],
+    max_emails: int = 40,
+) -> Tuple[Optional[pd.DataFrame], Dict[str, int]]:
     # Ensure COM is initialized for this thread during Outlook access
     try:
         import pythoncom  # type: ignore
@@ -32,11 +36,12 @@ def run_outlook(mailbox: str, folder_path: List[str], max_emails: int = 40) -> p
     try:
         folder = get_outlook_folder(mailbox, folder_path)
         if folder is None:
-            return None
+            return None, {"retrieved_emails": 0, "parsed_emails": 0, "parsed_rows": 0}
         msgs = newest_mail_items(folder, n=max_emails)
         if not msgs:
-            return None
+            return None, {"retrieved_emails": 0, "parsed_emails": 0, "parsed_rows": 0}
         frames = []
+        parsed_emails = 0
         for m in msgs:
             try:
                 sender = resolve_smtp(m) or ""
@@ -46,9 +51,15 @@ def run_outlook(mailbox: str, folder_path: List[str], max_emails: int = 40) -> p
             df = run_on_html(html, sender)
             if df is not None and not df.empty:
                 frames.append(df)
+                parsed_emails += 1
+        stats = {
+            "retrieved_emails": len(msgs),
+            "parsed_emails": parsed_emails,
+            "parsed_rows": int(sum(len(f) for f in frames)) if frames else 0,
+        }
         if frames:
-            return pd.concat(frames, ignore_index=True)
-        return None
+            return pd.concat(frames, ignore_index=True), stats
+        return None, stats
     finally:
         try:
             if pythoncom is not None:

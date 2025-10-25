@@ -7,9 +7,12 @@ Prerequisites
 - (Optional) Microsoft Outlook installed if you plan to use the "Outlook Folder" input source
 
 Quick Start
-1) Copy the entire folder (including this README, run_app.bat, requirements.txt, streamlit_app.py, and the app_core folder) to the target Windows machine.
-2) Double-click run_app.bat.
-   - The script creates a local virtual environment in .venv, upgrades pip, installs dependencies from requirements.txt, and launches the app.
+1) Copy the entire folder (including this README, requirements.txt, streamlit_app.py, and the app_core folder) to the target Windows machine.
+2) Open a terminal in the folder and run:
+   - python -m venv .venv
+   - .venv\Scripts\activate
+   - pip install --upgrade pip -r requirements.txt
+   - streamlit run streamlit_app.py
 3) Your browser should open automatically. If not, open http://localhost:8501/ manually.
 
 Notes
@@ -19,6 +22,6 @@ Notes
 
 Troubleshooting
 - "python is not recognized": Install Python from https://www.python.org/downloads/ and ensure "Add Python to PATH" is checked during installation.
-- "Failed building wheel" or install errors: Update pip (`python -m pip install --upgrade pip`) and retry run_app.bat. Corporate proxies may require additional pip configuration.
+- "Failed building wheel" or install errors: Update pip (`python -m pip install --upgrade pip`) and retry the install step. Corporate proxies may require additional pip configuration.
 - Outlook automation errors: Ensure Outlook is installed, running, and a profile/mailbox is configured. You can still use the non-Outlook input modes.
 

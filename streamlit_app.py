@@ -1,4 +1,4 @@
-﻿import io
+import io
 import os
 from typing import Optional, List
 
@@ -11,13 +11,7 @@ from app_core.extractors import (
     EXTRACTOR_BY_ISSUER,
 )
 from app_core.normalizers import normalize
-from app_core.email_integration import (
-    get_outlook_folder,
-    newest_mail_items,
-    clean_html_from_mail_item,
-    resolve_smtp,
-)
-from app_core.pipeline import run_on_html, run_outlook
+from app_core.pipeline import run_on_html
 from app_core.graph_auth import (
     load_config as graph_load_config,
     build_app as graph_build_app,
@@ -25,6 +19,8 @@ from app_core.graph_auth import (
     exchange_code_for_token as graph_exchange_code,
     get_me as graph_get_me,
     DEFAULT_SCOPES as GRAPH_SCOPES,
+    get_serializable_cache as graph_get_cache,
+    save_cache as graph_save_cache,
 )
 # Removed ticker lookup imports (CSV/API suggestions) per request
 
@@ -47,9 +43,7 @@ except Exception:
     pass
 
 # Top-level tabs: keep existing parser flow and add an Email Pricing tab
-tab_parser, tab_graph, tab_email_pricing, tab_outlook = st.tabs(["Parser", "Graph Parser", "Email Pricing", "Outlook Test"]) 
-with tab_parser:
-    st.caption("Parser UI is currently rendered below and will be moved into this tab in a later refactor.")
+tab_graph, tab_email_pricing = st.tabs(["Graph Parser", "Email Pricing"]) 
 
 
 def _build_underlyings_key(row: pd.Series) -> str:
@@ -151,15 +145,25 @@ def _graph_call(url: str, token: str, params: dict | None = None) -> dict:
 
 
 def _graph_find_folder_by_path(token: str, folder_path: str) -> str | None:
-    """Return folder id for a displayName path like 'Inbox/Pricer'. Case-insensitive."""
+    """Return folder id by displayName path like 'Pricer'.
+    - Ignores trailing slashes and case
+    - Uses well-known 'inbox' id to avoid localization issues
+    """
     parts = [p.strip() for p in (folder_path or "Inbox").split("/") if p.strip()]
     if not parts:
         parts = ["Inbox"]
-    # Start from root mail folders
-    data = _graph_call("https://graph.microsoft.com/v1.0/me/mailFolders", token, params={"$top": 200})
+    # If starts with Inbox, use well-known path first
+    items = []
+    idx = 0
+    if parts and parts[0].lower() == "inbox":
+        idx = 1
+        data = _graph_call("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/childFolders", token, params={"$top": 200})
+        items = data.get("value", [])
+    else:
+        data = _graph_call("https://graph.microsoft.com/v1.0/me/mailFolders", token, params={"$top": 200})
+        items = data.get("value", [])
     current = None
-    items = data.get("value", [])
-    for name in parts:
+    for name in parts[idx:]:
         name_l = name.lower()
         match = None
         for it in items:
@@ -169,14 +173,13 @@ def _graph_find_folder_by_path(token: str, folder_path: str) -> str | None:
         if match is None:
             return None
         current = match
-        # Load children for next iteration
-        resp = _graph_call(
+        data = _graph_call(
             f"https://graph.microsoft.com/v1.0/me/mailFolders/{current.get('id')}/childFolders",
             token,
             params={"$top": 200},
         )
-        items = resp.get("value", [])
-    return current.get("id") if current else None
+        items = data.get("value", [])
+    return current.get("id") if current else ("inbox" if parts and parts[0].lower() == "inbox" and idx == len(parts) else None)
 
 
 def _graph_get_messages(token: str, folder_id: str, top: int = 40) -> list[dict]:
@@ -250,6 +253,125 @@ _graph_handle_callback(_graph_conf_boot)
 # ---------------------------------
 # Email Pricing tab (input scaffold)
 # ---------------------------------
+
+with tab_graph:
+    st.subheader("Graph Parser")
+    conf = graph_load_config()
+    redirect_uri = conf.get("redirect_uri") or "http://localhost:8501"
+    # Persistent cache (optional)
+    cache_path = os.path.join('.streamlit', 'msal_cache.json')
+    cache = None
+    try:
+        cache = graph_get_cache(cache_path)
+    except Exception:
+        cache = None
+
+    # Try silent token first
+    token = None
+    try:
+        app = graph_build_app(conf, cache=cache)
+        token = app.acquire_token_silent(["User.Read", "Mail.Read"], account=None)
+        if token and token.get("access_token"):
+            st.session_state["graph_token"] = token
+            try:
+                graph_save_cache(cache, cache_path)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Handle auth code callback
+    try:
+        qp = _get_query_params()
+        if (not st.session_state.get("graph_token")) and ("code" in qp):
+            code_param = qp.get("code")
+            if isinstance(code_param, (list, tuple)):
+                code_param = code_param[0] if code_param else None
+            if code_param:
+                app_cb = graph_build_app(conf, cache=cache)
+                token = graph_exchange_code(app_cb, code_param, ["User.Read", "Mail.Read"], redirect_uri)
+                if token and token.get("access_token"):
+                    st.session_state["graph_token"] = token
+                    try:
+                        graph_save_cache(cache, cache_path)
+                    except Exception:
+                        pass
+                    try:
+                        me = graph_get_me(token.get("access_token"))
+                        st.session_state["graph_me"] = me
+                    except Exception:
+                        pass
+                    cleaned = {k: v for k, v in qp.items() if k not in ("code", "state", "session_state")}
+                    _set_query_params(cleaned)
+                    st.toast("Microsoft Graph sign-in complete.")
+    except Exception as e:
+        st.error(f"Graph auth failed: {e}")
+
+    token = st.session_state.get("graph_token")
+    if not (token and token.get("access_token")):
+        st.info("Not signed in to Microsoft Graph.")
+        try:
+            app2 = graph_build_app(conf, cache=cache)
+            auth_url = graph_build_auth_url(app2, ["User.Read", "Mail.Read"], redirect_uri)
+            st.link_button("Sign in to Microsoft Graph", auth_url)
+        except Exception as e:
+            st.error(f"Failed to build auth URL: {e}")
+        st.stop()
+
+    me = st.session_state.get("graph_me") or {}
+    st.caption(f"Signed in as: {me.get('displayName') or me.get('userPrincipalName') or 'user'}")
+
+    graph_folder_path = st.text_input(
+        "Graph folder path",
+        value="Pricer",
+        help="Example: 'Pricer'. Trailing slash is ok.",
+        key="graph_folder_path",
+    )
+    graph_n = st.slider("Graph: newest N", 5, 200, 40, key="graph_n")
+
+    if st.button("Start Parsing via Graph", key="start_graph"):
+        access_token = st.session_state.get("graph_token", {}).get("access_token")
+        folder_id = _graph_find_folder_by_path(access_token, graph_folder_path)
+        if not folder_id:
+            st.warning(f"Graph folder not found: {graph_folder_path}")
+        else:
+            msgs = _graph_get_messages(access_token, folder_id, top=int(graph_n))
+            frames = []
+            parsed_emails = 0
+            for msg in msgs:
+                try:
+                    html, sender = _graph_extract_html_and_sender(msg)
+                    if not html:
+                        continue
+                    df = run_on_html(html, sender)
+                    if df is not None and not df.empty:
+                        frames.append(df)
+                        parsed_emails += 1
+                except Exception:
+                    continue
+            stats = {
+                "retrieved_emails": len(msgs),
+                "parsed_emails": parsed_emails,
+                "parsed_rows": int(sum(len(f) for f in frames)) if frames else 0,
+            }
+            st.session_state["df_all"] = pd.concat(frames, ignore_index=True) if frames else None
+            st.caption(
+                f"Processed {stats['retrieved_emails']} Graph emails • Parsed {stats['parsed_emails']} • Rows {stats['parsed_rows']}"
+            )
+
+    df_all = st.session_state.get("df_all")
+    if not isinstance(df_all, pd.DataFrame) or df_all.empty:
+        st.info("Click 'Start Parsing via Graph' to load emails.")
+    else:
+        st.subheader("Parsed Data Preview")
+        st.dataframe(df_all, use_container_width=True)
+        st.download_button(
+            "Download Parsed CSV",
+            data=df_all.to_csv(index=False).encode("utf-8"),
+            file_name="parsed_graph.csv",
+            mime="text/csv",
+            key="dl_graph_csv",
+        )
 with tab_email_pricing:
     st.subheader("Email Pricing")
     st.caption("Enter product details; we'll build a horizontal table email draft.")
@@ -477,52 +599,21 @@ with tab_email_pricing:
     st.caption("Actions")
     colA, colB = st.columns([1,1])
     with colA:
-        if st.button("Open Draft in Outlook", key="ep_open_outlook"):
-            try:
-                html_body = st.session_state.get("pricing_email_html")
-                subject = st.session_state.get("pricing_email_subject", "Pricing Request")
-                if not html_body:
-                    st.warning("Prepare Email Preview first to generate the body.")
-                else:
-                    import pythoncom  # type: ignore
-                    pythoncom.CoInitialize()
-                    import win32com.client as win32  # type: ignore
-                    outlook = win32.Dispatch("Outlook.Application")
-                    mail = outlook.CreateItem(0)  # olMailItem
-                    mail.Subject = subject
-                    try:
-                        mail.BodyFormat = 2  # olFormatHTML
-                    except Exception:
-                        pass
-                    mail.HTMLBody = html_body + getattr(mail, "HTMLBody", "")
-                    mail.Display()
-                    st.success("Outlook draft opened.")
-            except Exception as e:
-                st.exception(e)
-            finally:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
+        if st.button("Download Email HTML", key="ep_download_html"):
+            html_body = st.session_state.get("pricing_email_html")
+            if not html_body:
+                st.warning("Prepare Email Preview first to generate the body.")
+            else:
+                st.download_button(
+                    "Save HTML Body",
+                    data=html_body.encode("utf-8"),
+                    file_name="pricing_email.html",
+                    mime="text/html",
+                    key="ep_dl_inner",
+                )
     with colB:
-        if st.button("Open Blank Outlook Email", key="ep_test_outlook_inline"):
-            try:
-                import pythoncom  # type: ignore
-                pythoncom.CoInitialize()
-                import win32com.client as win32  # type: ignore
-                outlook = win32.Dispatch("Outlook.Application")
-                mail = outlook.CreateItem(0)
-                mail.Subject = ""
-                mail.Body = ""
-                mail.Display()
-                st.success("Blank Outlook email opened.")
-            except Exception as e:
-                st.exception(e)
-            finally:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
+        st.caption("Copy/paste this HTML into your email client:")
+        st.text_area("Email HTML", value=st.session_state.get("pricing_email_html", ""), height=180)
 
 
 # Issuer abbreviation mapping for display and filtering
@@ -734,6 +825,9 @@ def _build_issuer_compare_table_df(
     # Build rows per issuer
     for display, code, rating in ISSUER_DISPLAY_RATINGS:
         row = {"Emittent": display, "Rating": rating}
+        # Guard: stop rendering if no data yet
+        if not isinstance(df_all, pd.DataFrame) or df_all.empty:
+            st.stop()
         # Collect numeric sort keys per version
         sort_keys = []
         for idx, vals in enumerate(per_version_vals):
@@ -770,1033 +864,3 @@ def _build_issuer_compare_table_df(
     # Order columns: Emittent, Rating, then version columns
     version_cols = [c for c in dfx.columns if c not in ("Emittent", "Rating")]
     return dfx[["Emittent", "Rating", *version_cols]]
-
-
-with st.sidebar:
-    st.header("Outlook Folder")
-    st.info("Requires Outlook/pywin32 on this machine.")
-    mailbox = st.text_input("Mailbox SMTP or display name", value="boulbenmeyer@calebocapital.ch")
-    # Default to just 'Pricer' to match the user's setup. The Outlook
-    # integration will also try Inbox/ as a fallback automatically.
-    folder_path = st.text_input("Folder path (use '/' for nesting)", value="Pricer")
-    n = st.slider("Fetch newest N emails", 5, 200, 40)
-
-    issuer_keys = [k for k in EXTRACTOR_BY_ISSUER.keys()]
-    issuer_override = st.selectbox(
-        "Issuer override (optional)",
-        [""] + issuer_keys,
-        index=0,
-        help="If set, forces this issuer's extractor/normalizer",
-    )
-    issuer_override = issuer_override or None
-
-    st.divider()
-    st.header("Microsoft Graph")
-    st.caption("Sign in and load emails via Graph (cloud)")
-    conf = graph_load_config()
-    redirect_uri = conf.get("redirect_uri") or "http://localhost:8501"
-    # Quick config diagnostics (no secret value shown)
-    _cid = conf.get("client_id") or ""
-    _tid = conf.get("tenant_id") or ""
-    _csec = bool(conf.get("client_secret"))
-    if not _cid:
-        st.warning("AZURE_CLIENT_ID is not set. Create .streamlit/secrets.toml with your app values.")
-    if not _tid:
-        st.info("Using default tenant 'common'. Set AZURE_TENANT_ID to restrict to your tenant.")
-    st.caption(
-        "Config status → "
-        + ("client_id: MISSING • " if not _cid else "client_id: OK • ")
-        + ("tenant_id: " + (_tid[:6] + "…" if _tid else "common"))
-        + " • client_secret: " + ("OK" if _csec else "MISSING")
-    )
-    # Preflight: block Graph sign-in if required config is missing
-    _graph_ready = True
-    _missing = []
-    if not _cid:
-        _missing.append("AZURE_CLIENT_ID")
-    if not (conf.get("redirect_uri") or "").strip():
-        _missing.append("AZURE_REDIRECT_URI")
-    if _missing:
-        _graph_ready = False
-        st.error(
-            "Microsoft Graph is not configured: missing "
-            + ", ".join(_missing)
-            + ". Update .streamlit/secrets.toml and restart the app."
-        )
-    # Exchange authorization code if present
-    qp = _get_query_params()
-    _has_token = bool(st.session_state.get("graph_token", {}).get("access_token"))
-    try:
-        if _graph_ready and (not _has_token) and ("code" in qp):
-            app = graph_build_app(conf)
-            code_param = qp.get("code")
-            if isinstance(code_param, (list, tuple)):
-                code_param = code_param[0] if code_param else None
-            if code_param:
-                token = graph_exchange_code(app, code_param, GRAPH_MAIL_SCOPES, redirect_uri)
-                if token and token.get("access_token"):
-                    st.session_state["graph_token"] = token
-                    # Optional: fetch profile to show signed-in user
-                    try:
-                        me = graph_get_me(token.get("access_token"))
-                    except Exception:
-                        me = {}
-                    st.session_state["graph_me"] = me
-                    # Clean code from URL
-                    cleaned = {k: v for k, v in qp.items() if k not in ("code", "state", "session_state")}
-                    _set_query_params(cleaned)
-                    st.success("Microsoft Graph sign-in complete.")
-                else:
-                    err = (token or {}).get("error_description") or (token or {}).get("error") or "Unknown token error"
-                    st.error(f"Graph token error: {err}")
-    except Exception as e:
-        st.error(f"Graph auth failed: {e}")
-
-    token = st.session_state.get("graph_token")
-    if token and token.get("access_token"):
-        me = st.session_state.get("graph_me") or {}
-        disp = me.get("displayName") or me.get("userPrincipalName") or "Signed in"
-        st.success(f"{disp}")
-        graph_folder_path = st.text_input("Graph folder path", value="Inbox/Pricer", key="graph_folder_path")
-        graph_n = st.slider("Graph: newest N", 5, 200, 40, key="graph_n_slider")
-    else:
-        st.info("Not signed in to Microsoft Graph.")
-        if _graph_ready:
-            try:
-                app = graph_build_app(conf)
-                auth_url = graph_build_auth_url(app, GRAPH_MAIL_SCOPES, redirect_uri)
-                st.markdown(f"[Sign in with Microsoft]({auth_url})")
-                st.caption(f"Redirect URI: {redirect_uri}")
-            except Exception as e:
-                st.error(f"Configure Azure app in .streamlit/secrets.toml: {e}")
-
-    # Diagnostics to help when no data is parsed
-    with st.expander("Diagnostics: Outlook folder/parse", expanded=False):
-        st.caption("Helps verify folder selection and sender/issuer mapping.")
-        peek_n = st.number_input("Peek newest N", min_value=1, max_value=50, value=5, step=1, key="peek_n")
-        if st.button("Peek selected Outlook folder", key="peek_btn"):
-            try:
-                folder = get_outlook_folder(mailbox, [p for p in (folder_path or '').split('/') if p])
-                if folder is None:
-                    st.error("Folder not found or Outlook not available. Check mailbox and path (use Inbox/Subfolder).")
-                else:
-                    msgs = newest_mail_items(folder, n=int(peek_n))
-                    if not msgs:
-                        st.warning("No messages found in the selected folder.")
-                    else:
-                        rows = []
-                        for m in msgs:
-                            try:
-                                sender = resolve_smtp(m) or ""
-                                subj = str(getattr(m, "Subject", ""))
-                                html = clean_html_from_mail_item(m)
-                                # Detected issuer and rows if using detected vs override
-                                from app_core.extractors import extract_for_sender as _efs
-                                det_df, det_issuer = _efs(html, sender)
-                                # Use pipeline normalize path to count rows reliably
-                                from app_core.pipeline import run_on_html as _roh
-                                out_det = _roh(html, sender)
-                                out_over = _roh(html, sender, issuer_override=issuer_override)
-                                rows.append({
-                                    "subject": subj[:120],
-                                    "sender": sender,
-                                    "detected_issuer": det_issuer or "-",
-                                    "rows_detected": 0 if (out_det is None) else len(out_det),
-                                    "rows_override": 0 if (out_over is None) else len(out_over),
-                                })
-                            except Exception:
-                                continue
-                        if rows:
-                            st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                        else:
-                            st.info("No peek rows to show.")
-            except Exception as e:
-                st.error(f"Diagnostics failed: {e}")
-
-
-with tab_parser:
-    st.subheader("Parser")
-    cols_btn = st.columns([1, 4])
-    with cols_btn[0]:
-        start = st.button("Start Parsing", key="start_parsing_btn")
-
-    if start:
-        result = run_outlook(
-            mailbox,
-            [p for p in folder_path.split('/') if p],
-            max_emails=n,
-            issuer_override=issuer_override,
-        )
-        # Support both new (df, stats) and old (df) return signatures
-        if isinstance(result, tuple) and len(result) == 2:
-            df_all, stats = result
-        else:
-            df_all, stats = result, {"retrieved_emails": n, "parsed_emails": 0, "parsed_rows": len(result) if hasattr(result, "__len__") else 0}
-
-        if df_all is None or df_all.empty:
-            st.warning("No data parsed from Outlook.")
-        else:
-            # Store results silently (no green success banner per request)
-            st.session_state["df_all"] = df_all
-        # Always show processing stats for clarity
-        st.caption(
-            f"Processed {stats.get('retrieved_emails', 0)} emails • Parsed {stats.get('parsed_emails', 0)} emails • Parsed data rows {stats.get('parsed_rows', 0)}"
-        )
-
-    # Removed 'Load via Graph' from this tab as requested
-
-    # Render results and selection UI within this tab
-    def _render_outlook_selection_ui_parser() -> None:
-        df_all = st.session_state.get("df_all")
-        if not isinstance(df_all, pd.DataFrame) or df_all.empty:
-            st.info("Provide input and click Start Parsing to begin.")
-            return
-
-        st.subheader("Select Versions")
-        # Variable to solve for
-        possible_vars = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all.columns]
-        if not possible_vars:
-            st.warning("No standard metric columns (coupon, strike, reoffer, barrier) found in parsed data. Showing parsed table.")
-            st.dataframe(df_all, use_container_width=True)
-            st.download_button(
-                "Download Parsed CSV",
-                data=df_all.to_csv(index=False).encode("utf-8"),
-                file_name="parsed_raw.csv",
-                mime="text/csv",
-                key="dl_csv_parsed_raw_parser",
-            )
-            return
-        solve_var = st.selectbox(
-            "Select variable you are solving for:", options=possible_vars, index=0, key="solve_var_parser"
-        )
-
-        # Key components
-        st.caption("Select Key Components:")
-        label_map = {
-            "underlyings": "Underlyings",
-            "tenor": "Tenor",
-            "barrier_type": "Barrier type",
-            "barrier": "Barrier",
-            "no_call_period": "No call period",
-            "strike": "Strike",
-            "coupon": "Coupon",
-            "reoffer": "Reoffer",
-        }
-        help_map = {
-            "underlyings": "Group by the underlying basket (codes 1..5)",
-            "tenor": "Tenor in months",
-            "barrier_type": "European/American",
-            "barrier": "Barrier level (%)",
-            "no_call_period": "Autocall from period (months)",
-            "strike": "Put strike (%)",
-            "coupon": "Coupon % p.a.",
-            "reoffer": "Reoffer (%)",
-        }
-        comp_order = [
-            "underlyings", "tenor", "barrier_type", "barrier",
-            "no_call_period", "strike", "coupon", "reoffer",
-        ]
-        comp_default = {k: True for k in comp_order}
-        comp_default["reoffer"] = False
-        components, selected_labels = [], []
-        per_row = 4
-        for row_start in range(0, len(comp_order), per_row):
-            row_items = comp_order[row_start:row_start+per_row]
-            ccols = st.columns(len(row_items))
-            for j, name in enumerate(row_items):
-                label = label_map[name]
-                disabled = (name == solve_var)
-                checked = comp_default[name] and not disabled
-                with ccols[j]:
-                    val = st.checkbox(
-                        label,
-                        value=checked,
-                        disabled=disabled,
-                        help=help_map.get(name),
-                        key=f"ck_{name}_parser",
-                    )
-                if val:
-                    components.append(name)
-                    selected_labels.append(label)
-        st.caption("Current key: " + " + ".join(selected_labels) if components else "Current key: (none)")
-
-        # Grouping for versions
-        def _get_version_labels_and_map(df: pd.DataFrame, components: list[str], solve_var: str):
-            tmp = df.copy()
-            tmp = tmp.assign(_version_key=_make_key(tmp, components))
-            asc_local = False if solve_var == "coupon" else True
-            try:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(
-                        rows=(solve_var, "size"),
-                        issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
-                        issuer_list=(
-                            "issuer",
-                            lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })
-                        ),
-                        metric=(solve_var, "mean"),
-                    )
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            except Exception:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(rows=(solve_var, "size"), metric=(solve_var, "mean"))
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            recs = grp.to_dict("records")
-            def _label(rec: dict) -> str:
-                key = rec.get("_version_key", "")
-                key_disp = _bold_text(str(key))
-                cnt = int(rec.get("issuers", 0))
-                ilist = list(rec.get("issuer_list", [])) if "issuer_list" in rec else []
-                if len(ilist) > 10:
-                    ilist = ilist[:10] + [f"+{len(ilist)-10}"]
-                issuers_txt = ", ".join(ilist) if ilist else "-"
-                return f"{key_disp} ({cnt} issuers: {issuers_txt})"
-            labels = [_label(r) for r in recs]
-            vmap = {lab: r.get("_version_key", "") for lab, r in zip(labels, recs)}
-            return labels, vmap, recs
-
-        version_labels, version_map, recs_internal = _get_version_labels_and_map(df_all, components, solve_var)
-
-        mode = st.radio("Mode:", options=["Single version", "Compare versions"], index=0, key="mode_parser")
-
-        if mode == "Single version":
-            selected_label = st.selectbox(
-                "Choose version",
-                options=(version_labels or ["(no versions)"]),
-                help="Labels show the version key plus the issuers included (hover to read full label).",
-                key="sel_version_parser",
-            )
-            selected_versions = [version_map.get(selected_label, "")] if version_labels else []
-        else:
-            selected_labels_multi = st.multiselect(
-                "Choose versions",
-                options=version_labels,
-                default=version_labels[:2],
-                help="Labels include issuer abbreviations for each version.",
-                key="sel_versions_multi_parser",
-            )
-            selected_versions = [version_map[l] for l in selected_labels_multi]
-            if selected_labels_multi:
-                items = []
-                for idx, lab in enumerate(selected_labels_multi, start=1):
-                    rec = None
-                    try:
-                        for l, r in zip(version_labels, recs_internal):
-                            if l == lab:
-                                rec = r
-                                break
-                    except Exception:
-                        rec = None
-                    ilist = list(rec.get("issuer_list", [])) if rec is not None else []
-                    items.append(f"V{idx}: {', '.join(ilist) if ilist else '-'}")
-                st.caption("Issuers per selected version → " + " | ".join(items))
-
-        df_view = df_all.copy()
-        df_view = df_view.assign(_version_key=_make_key(df_view, components))
-
-        if st.button("Confirm Selection", key="confirm_btn_parser"):
-            out = df_view[df_view["_version_key"].isin(selected_versions)].copy() if selected_versions else df_view.copy()
-            _metric = (solve_var or "coupon").lower()
-            asc = False if _metric == "coupon" else True
-            if solve_var in out.columns:
-                out = out.sort_values(by=[solve_var], ascending=asc)
-            if "issuer" in out.columns:
-                out["issuer"] = out["issuer"].apply(_abbr)
-            out_display = out.where(out.notna(), "NA")
-            st.session_state["confirmed_out"] = out
-            st.session_state["confirmed_out_display"] = out_display
-            st.session_state["confirmed_solve_var"] = solve_var
-            st.session_state["confirmed_mode"] = mode
-            if mode == "Single version":
-                st.session_state["confirmed_versions"] = selected_versions
-                st.session_state["confirmed_version_titles"] = ["V1"]
-            else:
-                st.session_state["confirmed_versions"] = selected_versions
-                st.session_state["confirmed_version_titles"] = [f"V{i+1}" for i in range(len(selected_versions))]
-            st.session_state["confirmed"] = True
-
-            if st.session_state.get("confirmed") and isinstance(st.session_state.get("confirmed_out_display"), pd.DataFrame):
-                out = st.session_state["confirmed_out"]
-                out_display = st.session_state["confirmed_out_display"]
-                st.subheader("Result Table (Confirmed)")
-                confirmed_solve_var = st.session_state.get("confirmed_solve_var", "coupon")
-                confirmed_mode = st.session_state.get("confirmed_mode", "Single version")
-                if confirmed_mode == "Compare versions":
-                    versions = st.session_state.get("confirmed_versions", [])
-                    titles = st.session_state.get("confirmed_version_titles", [])
-                    issuer_table_df = _build_issuer_compare_table_df(out, confirmed_solve_var, versions, titles)
-                else:
-                    issuer_table_df = _build_issuer_table_df(out, confirmed_solve_var)
-                st.dataframe(issuer_table_df, use_container_width=True)
-                csv_persist = issuer_table_df.to_csv(index=False).encode("utf-8")
-                file_metric = ("coupon" if confirmed_solve_var == "coupon" else confirmed_solve_var.title())
-                st.download_button(
-                    "Download CSV (Confirmed)",
-                    data=csv_persist,
-                    file_name=f"issuer_rating_{file_metric}.csv",
-                    mime="text/csv",
-                    key="dl_csv_confirmed_parser",
-                )
-
-                st.subheader("Email Output")
-                template_path = st.text_input(
-                    "Outlook template (.oft) path",
-                    value=st.session_state.get(
-                        "template_path",
-                        r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\Issuers.oft",
-                    ),
-                    key="template_path_parser",
-                    help="Provide the .oft template used to compose the email",
-                )
-                if st.button("Generate Outlook Email", key="gen_email_btn_parser"):
-                    try:
-                        import os
-                        if not os.path.exists(template_path):
-                            raise FileNotFoundError(f"Template not found: {template_path}")
-                        import pythoncom  # type: ignore
-                        pythoncom.CoInitialize()
-                        import win32com.client as win32  # type: ignore
-                        outlook = win32.Dispatch("Outlook.Application")
-                        mail = outlook.CreateItemFromTemplate(template_path)
-                        html_table = issuer_table_df.to_html(index=False)
-                        try:
-                            mail.HTMLBody = f"<div>{html_table}</div>" + mail.HTMLBody
-                        except Exception:
-                            mail.Body = issuer_table_df.to_csv(index=False) + "\n\n" + getattr(mail, "Body", "")
-                        mail.Display()
-                        st.success("Outlook email window opened from template.")
-                    except Exception as e:
-                        st.error(f"Failed to generate Outlook email: {e}")
-                    finally:
-                        try:
-                            pythoncom.CoUninitialize()
-                        except Exception:
-                            pass
-                st.subheader(f"Result Table (Solved for {confirmed_solve_var})")
-                st.dataframe(out_display, use_container_width=True)
-                csv_full = out_display.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Full CSV",
-                    data=csv_full,
-                    file_name="parsed_selection.csv",
-                    mime="text/csv",
-                    key="dl_csv_full_confirmed_parser",
-                )
-        
-        
-    _render_outlook_selection_ui_parser()
-
-
-with tab_graph:
-    st.subheader("Graph Parser")
-    # Require sign-in
-    token = st.session_state.get("graph_token")
-    if not (token and token.get("access_token")):
-        st.warning("You are not signed in to Microsoft Graph.")
-        try:
-            conf_local = graph_load_config()
-            redirect_uri_local = conf_local.get("redirect_uri") or "http://localhost:8501"
-            app_local = graph_build_app(conf_local)
-            auth_url_local = graph_build_auth_url(app_local, GRAPH_MAIL_SCOPES, redirect_uri_local)
-            # Offer sign-in right here in the tab
-            st.link_button("Sign in with Microsoft", auth_url_local)
-            st.caption(f"Redirect URI: {redirect_uri_local}")
-        except Exception as e:
-            st.error(f"Configure Azure app in .streamlit/secrets.toml: {e}")
-        # Do NOT stop the whole app; allow other tabs/sections to render
-        # so Outlook parsing results can be seen without Graph sign-in.
-        pass
-    # Controls
-    colg = st.columns([1,1,4])
-    with colg[0]:
-        start_graph_tab = st.button("Start Parsing via Graph", key="start_graph_tab_btn")
-    with colg[1]:
-        if st.button("Sign out", key="graph_signout_btn"):
-            st.session_state.pop("graph_token", None)
-            st.session_state.pop("graph_me", None)
-            st.rerun()
-
-    if start_graph_tab:
-        # Guard: only proceed if a Graph token is present
-        if not (token and token.get("access_token")):
-            st.warning("You are not signed in to Microsoft Graph.")
-        else:
-            try:
-                access_token = token.get("access_token")
-                g_path = st.session_state.get("graph_folder_path") or "Inbox"
-                g_n = int(st.session_state.get("graph_n_slider") or 40)
-                folder_id = _graph_find_folder_by_path(access_token, g_path)
-                if not folder_id:
-                    st.warning(f"Graph folder not found: {g_path}")
-                else:
-                    msgs = _graph_get_messages(access_token, folder_id, top=g_n)
-                    frames, parsed = [], 0
-                    for msg in msgs:
-                        html, sender = _graph_extract_html_and_sender(msg)
-                        if not html:
-                            continue
-                        df = run_on_html(html, sender)
-                        if df is not None and not df.empty:
-                            frames.append(df)
-                            parsed += 1
-                    stats = {"retrieved_emails": len(msgs), "parsed_emails": parsed, "parsed_rows": int(sum(len(f) for f in frames)) if frames else 0}
-                    if frames:
-                        st.session_state["df_all_graph"] = pd.concat(frames, ignore_index=True)
-                        st.caption(f"Processed {stats['retrieved_emails']} Graph emails • Parsed {stats['parsed_emails']} • Rows {stats['parsed_rows']}")
-                    else:
-                        st.warning("No data parsed from Graph messages.")
-            except Exception as e:
-                st.exception(e)
-
-    df_all_g = st.session_state.get("df_all_graph")
-    if not isinstance(df_all_g, pd.DataFrame) or df_all_g.empty:
-        st.info("Click 'Start Parsing via Graph' to load and parse emails.")
-        # Do not halt the entire app if Graph data is not loaded
-        st.caption("Graph data not loaded — Outlook parsing can still be used.")
-        st.write("")
-        # Skip rendering the Graph selection UI when empty
-        st.experimental_rerun if False else None
-        
-        # Short-circuit Graph tab rendering
-        pass
-    else:
-        st.subheader("Select Versions (Graph)")
-        possible_vars_g = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all_g.columns]
-        solve_var_g = st.selectbox("Select variable you are solving for:", options=possible_vars_g, index=0, key="g_solve_var")
-
-        st.caption("Select Key Components:")
-        label_map_g = {
-            "underlyings": "Underlyings",
-            "tenor": "Tenor",
-            "barrier_type": "Barrier type",
-            "barrier": "Barrier",
-            "no_call_period": "No call period",
-            "strike": "Strike",
-            "coupon": "Coupon",
-            "reoffer": "Reoffer",
-        }
-        help_map_g = {
-            "underlyings": "Group by the underlying basket (codes 1..5)",
-            "tenor": "Tenor in months",
-            "barrier_type": "European/American",
-            "barrier": "Barrier level (%)",
-            "no_call_period": "Autocall from period (months)",
-            "strike": "Put strike (%)",
-            "coupon": "Coupon % p.a.",
-            "reoffer": "Reoffer (%)",
-        }
-        comp_order_g = ["underlyings", "tenor", "barrier_type", "barrier", "no_call_period", "strike", "coupon", "reoffer"]
-        comp_default_g = {k: True for k in comp_order_g}; comp_default_g["reoffer"] = False
-        components_g, selected_labels_g = [], []
-        per_row = 4
-        for row_start in range(0, len(comp_order_g), per_row):
-            row_items = comp_order_g[row_start:row_start+per_row]
-            ccols = st.columns(len(row_items))
-            for j, name in enumerate(row_items):
-                label = label_map_g[name]
-                disabled = (name == solve_var_g)
-                checked = comp_default_g[name] and not disabled
-                with ccols[j]:
-                    val = st.checkbox(label, value=checked, disabled=disabled, help=help_map_g.get(name), key=f"g_ck_{name}")
-                if val:
-                    components_g.append(name)
-                    selected_labels_g.append(label)
-        st.caption("Current key: " + " + ".join(selected_labels_g) if components_g else "Current key: (none)")
-
-        # Build grouping based on selected key for preview/selection
-        def _get_version_labels_and_map_g(df: pd.DataFrame, components: list[str], solve_var: str):
-            tmp = df.copy()
-            tmp = tmp.assign(_version_key=_make_key(tmp, components))
-            asc_local = False if solve_var == "coupon" else True
-            try:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(
-                        rows=(solve_var, "size"),
-                        issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
-                        issuer_list=("issuer", lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })),
-                        metric=(solve_var, "mean"),
-                    )
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            except Exception:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(
-                        rows=(solve_var, "size"),
-                        metric=(solve_var, "mean"),
-                    )
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            recs = grp.to_dict("records")
-            def _label(rec: dict) -> str:
-                key = rec.get("_version_key", "")
-                key_disp = _bold_text(str(key))
-                cnt = int(rec.get("issuers", 0))
-                ilist = list(rec.get("issuer_list", [])) if "issuer_list" in rec else []
-                if len(ilist) > 10:
-                    ilist = ilist[:10] + [f"+{len(ilist)-10}"]
-                issuers_txt = ", ".join(ilist) if ilist else "-"
-                return f"{key_disp} ({cnt} issuers: {issuers_txt})"
-            labels = [_label(r) for r in recs]
-            vmap = {lab: r.get("_version_key", "") for lab, r in zip(labels, recs)}
-            return labels, vmap, recs
-
-        version_labels_g, version_map_g, recs_internal_g = _get_version_labels_and_map_g(df_all_g, components_g, solve_var_g)
-
-        mode_g = st.radio("Mode:", options=["Single version", "Compare versions"], index=0, key="g_mode")
-        if mode_g == "Single version":
-            selected_label_g = st.selectbox(
-                "Choose version",
-                options=(version_labels_g or ["(no versions)"]),
-                help="Labels show the version key plus the issuers included (hover to read full label).",
-                key="g_sel_version"
-            )
-            selected_versions_g = [version_map_g.get(selected_label_g, "")] if version_labels_g else []
-        else:
-            selected_labels_multi_g = st.multiselect(
-                "Choose versions",
-                options=version_labels_g,
-                default=version_labels_g[:2],
-                help="Labels include issuer abbreviations for each version.",
-                key="g_sel_versions_multi"
-            )
-            selected_versions_g = [version_map_g[l] for l in selected_labels_multi_g]
-            if selected_labels_multi_g:
-                items = []
-                for idx, lab in enumerate(selected_labels_multi_g, start=1):
-                    rec = None
-                    try:
-                        for l, r in zip(version_labels_g, recs_internal_g):
-                            if l == lab:
-                                rec = r
-                                break
-                    except Exception:
-                        rec = None
-                    ilist = list(rec.get("issuer_list", [])) if rec is not None else []
-                    items.append(f"V{idx}: {', '.join(ilist) if ilist else '-'}")
-                st.caption("Issuers per selected version → " + " | ".join(items))
-
-    try:
-        df_view_g = df_all_g.copy()
-        df_view_g = df_view_g.assign(_version_key=_make_key(df_view_g, components_g))
-
-        if st.button("Confirm Selection (Graph)", key="g_confirm_btn"):
-            out_g = df_view_g[df_view_g["_version_key"].isin(selected_versions_g)].copy() if selected_versions_g else df_view_g.copy()
-            _metric_g = (solve_var_g or "coupon").lower()
-            asc_g = False if _metric_g == "coupon" else True
-            if solve_var_g in out_g.columns:
-                out_g = out_g.sort_values(by=[solve_var_g], ascending=asc_g)
-            if "issuer" in out_g.columns:
-                out_g["issuer"] = out_g["issuer"].apply(_abbr)
-            out_display_g = out_g.where(out_g.notna(), "NA")
-            st.session_state["g_confirmed_out"] = out_g
-            st.session_state["g_confirmed_out_display"] = out_display_g
-            st.session_state["g_confirmed_solve_var"] = solve_var_g
-            st.session_state["g_confirmed_mode"] = mode_g
-            if mode_g == "Single version":
-                st.session_state["g_confirmed_versions"] = selected_versions_g
-                st.session_state["g_confirmed_version_titles"] = ["V1"]
-            else:
-                st.session_state["g_confirmed_versions"] = selected_versions_g
-                st.session_state["g_confirmed_version_titles"] = [f"V{i+1}" for i in range(len(selected_versions_g))]
-            st.session_state["g_confirmed"] = True
-
-            if st.session_state.get("g_confirmed") and isinstance(st.session_state.get("g_confirmed_out_display"), pd.DataFrame):
-                out_g = st.session_state["g_confirmed_out"]
-                out_display_g = st.session_state["g_confirmed_out_display"]
-
-                st.subheader("Result Table (Confirmed, Graph)")
-                confirmed_solve_var_g = st.session_state.get("g_confirmed_solve_var", "coupon")
-                confirmed_mode_g = st.session_state.get("g_confirmed_mode", "Single version")
-                if confirmed_mode_g == "Compare versions":
-                    versions_g = st.session_state.get("g_confirmed_versions", [])
-                    titles_g = st.session_state.get("g_confirmed_version_titles", [])
-                    issuer_table_df_g = _build_issuer_compare_table_df(out_g, confirmed_solve_var_g, versions_g, titles_g)
-                else:
-                    issuer_table_df_g = _build_issuer_table_df(out_g, confirmed_solve_var_g)
-                st.dataframe(issuer_table_df_g, use_container_width=True)
-                csv_persist_g = issuer_table_df_g.to_csv(index=False).encode("utf-8")
-                file_metric_g = ("coupon" if confirmed_solve_var_g == "coupon" else confirmed_solve_var_g.title())
-                st.download_button(
-                    "Download CSV (Confirmed, Graph)",
-                    data=csv_persist_g,
-                    file_name=f"issuer_rating_graph_{file_metric_g}.csv",
-                    mime="text/csv",
-                    key="g_dl_csv_confirmed",
-                )
-
-                st.subheader("Email Output (Graph)")
-                template_path_g = st.text_input(
-                    "Outlook template (.oft) path",
-                    value=st.session_state.get(
-                        "template_path_graph",
-                        r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\Issuers.oft",
-                    ),
-                    key="template_path_graph",
-                    help="Provide the .oft template used to compose the email",
-                )
-                if st.button("Generate Outlook Email (Graph)", key="g_gen_email_btn"):
-                    try:
-                        import os
-                        if not os.path.exists(template_path_g):
-                            raise FileNotFoundError(f"Template not found: {template_path_g}")
-                        import pythoncom  # type: ignore
-                        pythoncom.CoInitialize()
-                        import win32com.client as win32  # type: ignore
-                        outlook = win32.Dispatch("Outlook.Application")
-                        mail = outlook.CreateItemFromTemplate(template_path_g)
-                        html_table = issuer_table_df_g.to_html(index=False)
-                        try:
-                            mail.HTMLBody = f"<div>{html_table}</div>" + mail.HTMLBody
-                        except Exception:
-                            mail.Body = issuer_table_df_g.to_csv(index=False) + "\n\n" + getattr(mail, "Body", "")
-                        mail.Display()
-                        st.success("Outlook email window opened from template.")
-                    except Exception as e:
-                        st.error(f"Failed to generate Outlook email: {e}")
-                    finally:
-                        try:
-                            pythoncom.CoUninitialize()
-                        except Exception:
-                            pass
-
-                st.subheader(f"Result Table (Solved for {confirmed_solve_var_g}) — Graph")
-                st.dataframe(out_display_g, use_container_width=True)
-                csv_full_g = out_display_g.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download Full CSV (Graph)",
-                    data=csv_full_g,
-                    file_name="parsed_selection_graph.csv",
-                    mime="text/csv",
-                    key="g_dl_csv_full_confirmed",
-                )
-    except Exception:
-        # If Graph data is not loaded (df_all_g is None/empty), skip Graph confirm flow
-        pass
-
-
-    df_all = st.session_state.get("df_all")
-
-    if not isinstance(df_all, pd.DataFrame) or df_all.empty:
-        st.info("Provide input and click Start Parsing to begin.")
-    else:
-        st.subheader("Select Versions")
-
-        # Variable to solve for
-        possible_vars = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all.columns]
-        if not possible_vars:
-            st.warning("No standard metric columns (coupon, strike, reoffer, barrier) found in parsed data. Showing parsed table.")
-            st.dataframe(df_all, use_container_width=True)
-            st.download_button(
-                "Download Parsed CSV",
-                data=df_all.to_csv(index=False).encode("utf-8"),
-                file_name="parsed_raw.csv",
-                mime="text/csv",
-                key="dl_csv_parsed_raw",
-            )
-            st.stop()
-        solve_var = st.selectbox("Select variable you are solving for:", options=possible_vars, index=0)
-
-        # Key components
-        st.caption("Select Key Components:")
-        label_map = {
-            "underlyings": "Underlyings",
-            "tenor": "Tenor",
-            "barrier_type": "Barrier type",
-            "barrier": "Barrier",
-            "no_call_period": "No call period",
-            "strike": "Strike",
-            "coupon": "Coupon",
-            "reoffer": "Reoffer",
-        }
-        help_map = {
-            "underlyings": "Group by the underlying basket (codes 1..5)",
-            "tenor": "Tenor in months",
-            "barrier_type": "European/American",
-            "barrier": "Barrier level (%)",
-            "no_call_period": "Autocall from period (months)",
-            "strike": "Put strike (%)",
-            "coupon": "Coupon % p.a.",
-            "reoffer": "Reoffer (%)",
-        }
-        comp_order = [
-            "underlyings", "tenor", "barrier_type", "barrier",
-            "no_call_period", "strike", "coupon", "reoffer",
-        ]
-        # Default selections: everything except Reoffer
-        comp_default = {k: True for k in comp_order}
-        comp_default["reoffer"] = False
-        components, selected_labels = [], []
-        # Render as a neat 4x2 grid
-        per_row = 4
-        for row_start in range(0, len(comp_order), per_row):
-            row_items = comp_order[row_start:row_start+per_row]
-            ccols = st.columns(len(row_items))
-            for j, name in enumerate(row_items):
-                label = label_map[name]
-                disabled = (name == solve_var)
-                checked = comp_default[name] and not disabled
-                with ccols[j]:
-                    val = st.checkbox(label, value=checked, disabled=disabled, help=help_map.get(name))
-                if val:
-                    components.append(name)
-                    selected_labels.append(label)
-
-        st.caption("Current key: " + " + ".join(selected_labels) if components else "Current key: (none)")
-
-        # Build grouping based on selected key for preview/selection
-        def _get_version_labels_and_map(df: pd.DataFrame, components: list[str], solve_var: str):
-            tmp = df.copy()
-            tmp = tmp.assign(_version_key=_make_key(tmp, components))
-            asc_local = False if solve_var == "coupon" else True
-            try:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(
-                        rows=(solve_var, "size"),
-                        issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
-                        issuer_list=(
-                            "issuer",
-                            lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })
-                        ),
-                        metric=(solve_var, "mean"),
-                    )
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            except Exception:
-                grp = (
-                    tmp.groupby("_version_key")
-                    .agg(
-                        rows=(solve_var, "size"),
-                        metric=(solve_var, "mean"),
-                    )
-                    .reset_index()
-                    .sort_values(by=["metric"], ascending=asc_local)
-                )
-            recs = grp.to_dict("records")
-            def _label(rec: dict) -> str:
-                key = rec.get("_version_key", "")
-                key_disp = _bold_text(str(key))
-                cnt = int(rec.get("issuers", 0))
-                ilist = list(rec.get("issuer_list", [])) if "issuer_list" in rec else []
-                if len(ilist) > 10:
-                    ilist = ilist[:10] + [f"+{len(ilist)-10}"]
-                issuers_txt = ", ".join(ilist) if ilist else "-"
-                return f"{key_disp} ({cnt} issuers: {issuers_txt})"
-            labels = [_label(r) for r in recs]
-            vmap = {lab: r.get("_version_key", "") for lab, r in zip(labels, recs)}
-            return labels, vmap, recs
-
-        version_labels, version_map, recs_internal = _get_version_labels_and_map(df_all, components, solve_var)
-
-    # If no data yet, halt rendering of the rest of the section
-    if not (isinstance(df_all, pd.DataFrame) and not df_all.empty):
-        st.stop()
-
-    mode = st.radio("Mode:", options=["Single version", "Compare versions"], index=0)
-
-    # Ensure defaults without triggering Streamlit magic output
-    version_labels = locals().get("version_labels", [])
-    version_map = locals().get("version_map", {})
-
-    if mode == "Single version":
-        selected_label = st.selectbox(
-            "Choose version",
-            options=(version_labels or ["(no versions)"]),
-            help="Labels show the version key plus the issuers included (hover to read full label).",
-        )
-        selected_versions = [version_map[selected_label]] if version_labels else []
-    else:
-        selected_labels_multi = st.multiselect(
-            "Choose versions",
-            options=version_labels,
-            default=version_labels[:2],
-            help="Labels include issuer abbreviations for each version.",
-        )
-        selected_versions = [version_map[l] for l in selected_labels_multi]
-        # Show issuers per selected version as mini legend
-        if selected_labels_multi:
-            items = []
-            for idx, lab in enumerate(selected_labels_multi, start=1):
-                rec = None
-                try:
-                    for l, r in zip(version_labels, recs_internal):
-                        if l == lab:
-                            rec = r
-                            break
-                except Exception:
-                    rec = None
-                ilist = list(rec.get("issuer_list", [])) if rec is not None else []
-                items.append(f"V{idx}: {', '.join(ilist) if ilist else '-'}")
-            st.caption("Issuers per selected version → " + " | ".join(items))
-
-    # Minimal UI: no issuer filter; use full dataset
-    df_view = df_all.copy()
-
-    # Recompute key on filtered view for final output
-    key_series = _make_key(df_view, components)
-    df_view = df_view.assign(_version_key=key_series)
-
-    if st.button("Confirm Selection"):
-        out = df_view[df_view["_version_key"].isin(selected_versions)].copy() if selected_versions else df_view.copy()
-        # Determine sort direction: coupon desc, others asc
-        _metric = (solve_var or "coupon").lower()
-        asc = False if _metric == "coupon" else True
-        if solve_var in out.columns:
-            out = out.sort_values(by=[solve_var], ascending=asc)
-        # Replace issuer names by uppercase abbreviations and display NA
-        if "issuer" in out.columns:
-            out["issuer"] = out["issuer"].apply(_abbr)
-        out_display = out.where(out.notna(), "NA")
-        # Persist selection to survive reruns triggered by other buttons
-        st.session_state["confirmed_out"] = out
-        st.session_state["confirmed_out_display"] = out_display
-        st.session_state["confirmed_solve_var"] = solve_var
-        st.session_state["confirmed_mode"] = mode
-        if mode == "Single version":
-            st.session_state["confirmed_versions"] = selected_versions
-            st.session_state["confirmed_version_titles"] = ["V1"]
-        else:
-            st.session_state["confirmed_versions"] = selected_versions
-            # Titles V1, V2, V3 ... in the order selected
-            st.session_state["confirmed_version_titles"] = [f"V{i+1}" for i in range(len(selected_versions))]
-        st.session_state["confirmed"] = True
-        # Result and email are shown in the Confirmed section below
-
-    # Persistent actions area: reused after any rerun
-        if st.session_state.get("confirmed") and isinstance(st.session_state.get("confirmed_out_display"), pd.DataFrame):
-            out = st.session_state["confirmed_out"]
-            out_display = st.session_state["confirmed_out_display"]
-
-            st.subheader("Result Table (Confirmed)")
-            # Show issuer table: single or compare mode
-            confirmed_solve_var = st.session_state.get("confirmed_solve_var", "coupon")
-            confirmed_mode = st.session_state.get("confirmed_mode", "Single version")
-            if confirmed_mode == "Compare versions":
-                versions = st.session_state.get("confirmed_versions", [])
-                titles = st.session_state.get("confirmed_version_titles", [])
-                issuer_table_df = _build_issuer_compare_table_df(out, confirmed_solve_var, versions, titles)
-            else:
-                issuer_table_df = _build_issuer_table_df(out, confirmed_solve_var)
-            st.dataframe(issuer_table_df, use_container_width=True)
-            csv_persist = issuer_table_df.to_csv(index=False).encode("utf-8")
-            file_metric = ("coupon" if confirmed_solve_var == "coupon" else confirmed_solve_var.title())
-            st.download_button(
-                "Download CSV (Confirmed)",
-                data=csv_persist,
-                file_name=f"issuer_rating_{file_metric}.csv",
-                mime="text/csv",
-                key="dl_csv_confirmed",
-            )
-
-            st.subheader("Email Output")
-            template_path = st.text_input(
-                "Outlook template (.oft) path",
-                value=st.session_state.get(
-                    "template_path",
-                    r"C:\\Users\\yann.boulbenmeyer\\OneDrive - Calebo Capital AG\\Dokumente\\Email to Send Templates\\Issuers.oft",
-                ),
-                key="template_path",
-                help="Provide the .oft template used to compose the email",
-            )
-
-            # Single action: generate Outlook email with the issuer table for the selected metric
-            if st.button("Generate Outlook Email", key="gen_email_btn"):
-                try:
-                    import os
-                    if not os.path.exists(template_path):
-                        raise FileNotFoundError(f"Template not found: {template_path}")
-                    import pythoncom  # type: ignore
-                    pythoncom.CoInitialize()
-                    import win32com.client as win32  # type: ignore
-                    outlook = win32.Dispatch("Outlook.Application")
-                    mail = outlook.CreateItemFromTemplate(template_path)
-                    html_table = issuer_table_df.to_html(index=False)
-                    try:
-                        mail.HTMLBody = f"<div>{html_table}</div>" + mail.HTMLBody
-                    except Exception:
-                        # Fallback to plain text
-                        mail.Body = issuer_table_df.to_csv(index=False) + "\n\n" + getattr(mail, "Body", "")
-                    mail.Display()
-                    st.success("Outlook email window opened from template.")
-                except Exception as e:
-                    st.error(f"Failed to generate Outlook email: {e}")
-                finally:
-                    try:
-                        pythoncom.CoUninitialize()
-                    except Exception:
-                        pass
-            # Show the full selection table after the confirmed issuer table
-            st.subheader(f"Result Table (Solved for {confirmed_solve_var})")
-            st.dataframe(out_display, use_container_width=True)
-            csv_full = out_display.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "Download Full CSV",
-                data=csv_full,
-                file_name="parsed_selection.csv",
-                mime="text/csv",
-                key="dl_csv_full_confirmed",
-            )
-
-            # Debug table B: all rows across all versions, grouped by current key, sorted by issuer then version
-            try:
-                df_all_dbg = df_all.copy()
-                # Attach the current version key using the selected components
-                df_all_dbg = df_all_dbg.assign(_version_key=_make_key(df_all_dbg, components))
-                if "issuer" in df_all_dbg.columns:
-                    df_all_dbg["issuer"] = df_all_dbg["issuer"].apply(_abbr)
-                sort_cols = []
-                sort_asc = []
-                if "issuer" in df_all_dbg.columns:
-                    sort_cols.append("issuer"); sort_asc.append(True)
-                if "_version_key" in df_all_dbg.columns:
-                    sort_cols.append("_version_key"); sort_asc.append(True)
-                if confirmed_solve_var in df_all_dbg.columns:
-                    sort_cols.append(confirmed_solve_var)
-                    sort_asc.append(False if confirmed_solve_var == "coupon" else True)
-                if sort_cols:
-                    df_all_dbg = df_all_dbg.sort_values(by=sort_cols, ascending=sort_asc, na_position="last")
-                df_all_dbg_display = df_all_dbg.where(df_all_dbg.notna(), "NA")
-                st.subheader("Debug Table — All Versions (rows by issuer and version)")
-                st.dataframe(df_all_dbg_display, use_container_width=True)
-                st.download_button(
-                    "Download Debug (All Versions)",
-                    data=df_all_dbg_display.to_csv(index=False).encode("utf-8"),
-                    file_name="debug_all_versions_rows_by_issuer.csv",
-                    mime="text/csv",
-                    key="dl_csv_debug_all",
-                )
-            except Exception:
-                pass
-
-with tab_outlook:
-    st.subheader("Outlook Test")
-    st.caption("Click to open a new empty Outlook email. If nothing opens, a detailed error will be shown below.")
-    if st.button("Open Blank Outlook Email", key="blank_outlook_btn"):
-        try:
-            import pythoncom  # type: ignore
-            pythoncom.CoInitialize()
-            import win32com.client as win32  # type: ignore
-            outlook = win32.Dispatch("Outlook.Application")
-            mail = outlook.CreateItem(0)  # olMailItem
-            mail.Subject = ""
-            mail.Body = ""
-            mail.Display()
-            st.success("Opened a new blank Outlook email.")
-        except Exception as e:
-            st.exception(e)
-        finally:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass

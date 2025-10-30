@@ -4,6 +4,6 @@ numpy>=1.24
 beautifulsoup4>=4.12
 # pywin32 is Windows-only and currently not available for Python 3.13 wheels
 # Keep it optional so Linux/Streamlit Cloud deployments succeed
-pywin32>=306; sys_platform == 'win32' and python_version < '3.13'
+#pywin32>=306; sys_platform == 'win32' and python_version < '3.13'
 requests>=2.31
 streamlit-searchbox>=0.3.0

@@ -3,6 +3,5 @@ pandas>=2.0
 numpy>=1.24
 beautifulsoup4>=4.12
 requests>=2.31
-streamlit-searchbox>=0.3.0
+streamlit-searchbox==0.1.23
 msal
-

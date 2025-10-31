@@ -310,47 +310,102 @@ def _graph_headers(token: str) -> dict:
 
 
 def _graph_call(url: str, token: str, params: dict | None = None) -> dict:
-    r = requests.get(url, headers=_graph_headers(token), params=params or {}, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    """Call Graph and parse JSON robustly.
+    - Detects redirects/HTML and raises a clear error
+    - Handles empty 200/204 without crashing
+    """
+    resp = requests.get(url, headers=_graph_headers(token), params=params or {}, timeout=15, allow_redirects=True)
+    # Explicitly error on redirects to login/HTML pages that return 200 after redirect
+    ct = (resp.headers.get("Content-Type") or "").lower()
+    # Raise HTTP errors first
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        # Try to extract Graph error body if JSON
+        try:
+            data = resp.json()
+            err = (data.get("error") or {}) if isinstance(data, dict) else {}
+            msg = (err.get("message") or "").strip()
+            code = err.get("code") or resp.status_code
+            raise RuntimeError(f"Graph error {code}: {msg}") from e
+        except Exception:
+            # Non-JSON error body
+            snippet = (resp.text or "").strip()[:200]
+            raise RuntimeError(f"Graph HTTP {resp.status_code}. Body: {snippet}") from e
 
+    # No content at all is acceptable for some endpoints
+    text_body = (resp.text or "").strip()
+    if not text_body:
+        return {}
+    # Content-type must be JSON
+    if "application/json" not in ct and not (text_body.startswith("{") or text_body.startswith("[")):
+        snippet = text_body[:200]
+        raise RuntimeError(f"Graph returned non-JSON ({ct or 'unknown content-type'}). Body: {snippet}")
+    # Parse JSON
+    try:
+        return resp.json()
+    except Exception as e:
+        snippet = text_body[:200]
+        raise RuntimeError(f"Failed to parse Graph JSON. Body: {snippet}") from e
+
+
+LOCALIZED_INBOX = {"inbox", "posteingang"}
+
+def _graph_list_root_folders(token: str) -> list[dict]:
+    items: list[dict] = []
+    url = "https://graph.microsoft.com/v1.0/me/mailFolders?$top=200&$select=id,displayName,parentFolderId"
+    while url:
+        data = _graph_call(url, token)
+        items.extend(data.get("value", []) or [])
+        url = data.get("@odata.nextLink")
+    return items
+
+def _graph_list_children(token: str, parent_id: str) -> list[dict]:
+    items: list[dict] = []
+    url = f"https://graph.microsoft.com/v1.0/me/mailFolders/{parent_id}/childFolders?$top=200&$select=id,displayName,parentFolderId"
+    while url:
+        data = _graph_call(url, token)
+        items.extend(data.get("value", []) or [])
+        url = data.get("@odata.nextLink")
+    return items
 
 def _graph_find_folder_by_path(token: str, folder_path: str) -> str | None:
-    """Return folder id by displayName path like 'Pricer'.
-    - Ignores trailing slashes and case
-    - Uses well-known 'inbox' id to avoid localization issues
+    """Resolve a folder id by path like 'Inbox/Pricer' or 'Pricer'.
+    - Case-insensitive match on displayName
+    - Supports nested paths with '/'
+    - Paginates through results
+    - Fallback: when a single-part path isn't found at root, also search Inbox children
+    - Supports localized Inbox names (e.g., 'Posteingang')
     """
     parts = [p.strip() for p in (folder_path or "Inbox").split("/") if p.strip()]
     if not parts:
         parts = ["Inbox"]
-    # If starts with Inbox, use well-known path first
-    items = []
+
+    # Initial listing context
+    items: list[dict] = []
     idx = 0
-    if parts and parts[0].lower() == "inbox":
+    current: dict | None = None
+
+    if parts and parts[0].lower() in LOCALIZED_INBOX:
         idx = 1
-        data = _graph_call("https://graph.microsoft.com/v1.0/me/mailFolders/inbox/childFolders", token, params={"$top": 200})
-        items = data.get("value", [])
+        items = _graph_list_children(token, "inbox")
     else:
-        data = _graph_call("https://graph.microsoft.com/v1.0/me/mailFolders", token, params={"$top": 200})
-        items = data.get("value", [])
-    current = None
+        # Try root first
+        items = _graph_list_root_folders(token)
+        # If single segment not found at root, also try Inbox children as a convenience
+        if len(parts) == 1 and not any(str(it.get("displayName", "")).lower() == parts[0].lower() for it in items):
+            items = _graph_list_children(token, "inbox")
+
+    # Traverse remaining parts
     for name in parts[idx:]:
         name_l = name.lower()
-        match = None
-        for it in items:
-            if str(it.get("displayName", "")).lower() == name_l:
-                match = it
-                break
+        match = next((it for it in items if str(it.get("displayName", "")).lower() == name_l), None)
         if match is None:
             return None
         current = match
-        data = _graph_call(
-            f"https://graph.microsoft.com/v1.0/me/mailFolders/{current.get('id')}/childFolders",
-            token,
-            params={"$top": 200},
-        )
-        items = data.get("value", [])
-    return current.get("id") if current else ("inbox" if parts and parts[0].lower() == "inbox" and idx == len(parts) else None)
+        items = _graph_list_children(token, current.get("id"))
+
+    return current.get("id") if current else ("inbox" if parts and parts[0].lower() in LOCALIZED_INBOX and idx == len(parts) else None)
 
 
 def _graph_get_messages(token: str, folder_id: str, top: int = 40) -> list[dict]:
@@ -492,12 +547,25 @@ with tab_graph:
     me = st.session_state.get("graph_me") or {}
     st.caption(f"Signed in as: {me.get('displayName') or me.get('userPrincipalName') or 'user'}")
 
+    # Prefill from URL query params if available (so users can bookmark it)
+    try:
+        qp = _get_query_params()
+        qp_folder = qp.get("folder")
+        if isinstance(qp_folder, (list, tuple)):
+            qp_folder = qp_folder[0] if qp_folder else ""
+        if qp_folder and not st.session_state.get("graph_folder_path"):
+            st.session_state["graph_folder_path"] = str(qp_folder)
+    except Exception:
+        pass
+
     graph_folder_path = st.text_input(
         "Graph folder path",
-        value="Pricer",
-        help="Example: 'Pricer'. Trailing slash is ok.",
+        value=st.session_state.get("graph_folder_path", ""),
+        help="Examples: 'Inbox/Pricer' or 'Projects/Pricer'. Leave blank for Inbox.",
         key="graph_folder_path",
     )
+
+    # (Folder browse UI removed by request)
     graph_n = st.slider("Graph: newest N", 5, 200, 40, key="graph_n")
 
     if st.button("Start Parsing via Graph", key="start_graph"):
@@ -506,6 +574,11 @@ with tab_graph:
         if not folder_id:
             st.warning(f"Graph folder not found: {graph_folder_path}")
         else:
+            # Persist chosen folder path in URL so colleagues don't need to retype
+            try:
+                _set_query_params({"folder": graph_folder_path})
+            except Exception:
+                pass
             msgs = _graph_get_messages(access_token, folder_id, top=int(graph_n))
             frames = []
             parsed_emails = 0

@@ -73,6 +73,24 @@ def _make_key(df: pd.DataFrame, components: List[str]) -> pd.Series:
     return s
 
 
+# Early helpers to avoid NameError during initial UI render
+def _abbr(issuer: Optional[str]) -> str:
+    s = "NA" if issuer is None else str(issuer).strip()
+    if not s:
+        return "NA"
+    try:
+        return ABBR_MAP.get(s.lower(), s.upper())  # type: ignore[name-defined]
+    except Exception:
+        return s.upper()
+
+
+def _bold_text(s: str) -> str:
+    try:
+        # If later redefined, Streamlit reruns will use the full version
+        return str(s)
+    except Exception:
+        return str(s)
+
 def _get_query_params() -> dict:
     try:
         # Streamlit >= 1.30
@@ -111,6 +129,159 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# -------------------------------
+# Issuer table helpers (used early)
+# -------------------------------
+
+# Display ordering and ratings for issuer email table
+ISSUER_DISPLAY_RATINGS = [
+    ("Bank of America (Merrill Lynch)", "BOFA", "A- / A1"),
+    ("Banque Cantonale Vaudoise", "BCV", "AA / -"),
+    ("Barclays", "BARCLAYS", "A / A1"),
+    ("Basler Kantonalbank", "BKB", "AA+ / -"),
+    ("Banque Int. à Luxembourg", "BIL", "A- / A2"),
+    ("BBVA", "BBVA", "A+ / A3"),
+    ("BNP Paribas", "BNP", "A+ / Aa3"),
+    ("Canadian Imp. Bank of Comm.", "CIBC", "A+ / Aa2"),
+    ("Citi", "CITI", "A+ / A1"),
+    ("Cornèr Bank", "CORNER", "BBB+"),
+    ("Goldman Sachs", "GS", "A+ / A1"),
+    ("HSBC", "HSBC", "A+ / A1"),
+    ("JPMorgan", "JPM", "A+ / Aa2"),
+    ("Julius Bär", "JB", "- / A3"),
+    ("Leonteq", "LEONTEQ", "BBB"),
+    ("Luzerner KB", "LUKB", "AA+ / -"),
+    ("Marex", "MAREX", "BBB / -"),
+    ("Morgan Stanley", "MS", "A- / A1"),
+    ("Natixis", "NATIXIS", "A / A1"),
+    ("Nomura Bank International", "NOMURA", "A- / -"),
+    ("Raiffeisen", "RAIFFEISEN", "AA- / -"),
+    ("Société Générale", "SOCGEN", "A / A1"),
+    ("Swissquote", "SWISSQUOTE", "- / -"),
+    ("UBS", "UBS", "A+ /Aa2"),
+    ("Vontobel", "VONTOBEL", "- / A2"),
+    ("Zürcher Kantonalbank", "ZKB", "AAA / Aaa"),
+]
+
+def _best_values_by_issuer(df: pd.DataFrame, column: str, asc: bool) -> dict:
+    if column not in df.columns:
+        return {}
+    s = pd.to_numeric(df[column], errors="coerce")
+    tmp = pd.concat([df["issuer"], s.rename("val")], axis=1).dropna(subset=["val"])
+    if tmp.empty:
+        return {}
+    agg = tmp.groupby("issuer")["val"].agg("min" if asc else "max")
+    return agg.to_dict()
+
+def _format_var_value(val: Optional[float], var: str) -> str:
+    if val is None or pd.isna(val):
+        return "% p.a." if var == "coupon" else "%"
+    try:
+        v = float(val)
+    except Exception:
+        return "% p.a." if var == "coupon" else "%"
+    if var == "coupon":
+        return f"{v:.2f} % p.a."
+    else:
+        return f"{v:.2f} %"
+def _build_issuer_table_df(df: pd.DataFrame, solve_var: str) -> pd.DataFrame:
+    """Build issuer template table with dynamic sorting.
+    - Always display Emittent, Rating, Coupon
+    - Sort by: coupon desc; strike asc; barrier asc; default asc
+    - Coupon text shows numeric value or 'OUT' if missing
+    """
+    sort_var = (solve_var or "").strip().lower()
+    asc = False if sort_var == "coupon" else True
+    metric = sort_var if sort_var else "coupon"
+    sort_values = _best_values_by_issuer(df, metric, asc=asc)
+
+    rows = []
+    col_label = "Coupon" if metric == "coupon" else metric.title()
+    for display, code, rating in ISSUER_DISPLAY_RATINGS:
+        mval = sort_values.get(code)
+        if metric in ("coupon", "strike", "barrier"):
+            if mval is None or pd.isna(mval):
+                cell_text = "OUT"
+            else:
+                if metric == "coupon":
+                    cell_text = f"{float(mval):.2f} % p.a."
+                else:
+                    cell_text = f"{float(mval):.2f} %"
+        else:
+            cell_text = _format_var_value(mval, metric)
+        rows.append({
+            "Emittent": display,
+            "Rating": rating,
+            col_label: cell_text,
+            "__sort__": (None if mval is None or pd.isna(mval) else float(mval)),
+        })
+
+    dfx = pd.DataFrame(rows)
+    dfx = dfx.sort_values(by=["__sort__"], ascending=asc, na_position="last").drop(columns=["__sort__"])
+    return dfx[["Emittent", "Rating", col_label]]
+
+def _build_issuer_compare_table_df(
+    df: pd.DataFrame,
+    solve_var: str,
+    versions: List[str],
+    titles: List[str],
+) -> pd.DataFrame:
+    """Build an issuer table with multiple version columns (V1, V2, ...).
+    Sorting is applied on the first version according to solve_var rule."""
+    metric = (solve_var or "coupon").lower()
+    asc = False if metric == "coupon" else True
+
+    per_version_vals = []
+    for v in versions:
+        sub = df[df.get("_version_key") == v]
+        vals = _best_values_by_issuer(sub, metric, asc=asc)
+        per_version_vals.append(vals)
+
+    rows = []
+    for display, code, rating in ISSUER_DISPLAY_RATINGS:
+        row = {"Emittent": display, "Rating": rating}
+        # Ensure data exists; if not, stop safely
+        try:
+            if not isinstance(df_all, pd.DataFrame) or df_all.empty:
+                st.stop()
+        except Exception:
+            pass
+        sort_keys = []
+        for idx, vals in enumerate(per_version_vals):
+            mval = vals.get(code)
+            if metric in ("coupon", "strike", "barrier"):
+                if mval is None or pd.isna(mval):
+                    txt = "OUT"
+                    sort_keys.append(None)
+                else:
+                    num = float(mval)
+                    if metric == "coupon":
+                        txt = f"{num:.2f} % p.a."
+                    else:
+                        txt = f"{num:.2f} %"
+                    sort_keys.append(num)
+            else:
+                txt = _format_var_value(mval, metric)
+                try:
+                    sort_keys.append(None if mval is None or pd.isna(mval) else float(mval))
+                except Exception:
+                    sort_keys.append(None)
+            colname = f"{titles[idx]} {('Coupon' if metric=='coupon' else metric.title())}"
+            row[colname] = txt
+        for si, sval in enumerate(sort_keys):
+            row[f"__sort_{si}"] = sval
+        rows.append(row)
+
+    dfx = pd.DataFrame(rows)
+    sort_cols = [c for c in dfx.columns if c.startswith("__sort_")]
+    if sort_cols:
+        dfx = dfx.sort_values(by=sort_cols, ascending=[asc]*len(sort_cols), na_position="last")
+        dfx = dfx.drop(columns=sort_cols)
+    version_cols = [c for c in dfx.columns if c not in ("Emittent", "Rating")]
+    return dfx[["Emittent", "Rating", *version_cols]]
+
+# Display ordering and ratings for issuer email table (early definition)
+ 
 # Visual style for solved fields (red highlight)
 st.markdown(
     """
@@ -363,15 +534,152 @@ with tab_graph:
     if not isinstance(df_all, pd.DataFrame) or df_all.empty:
         st.info("Click 'Start Parsing via Graph' to load emails.")
     else:
-        st.subheader("Parsed Data Preview")
-        st.dataframe(df_all, use_container_width=True)
-        st.download_button(
-            "Download Parsed CSV",
-            data=df_all.to_csv(index=False).encode("utf-8"),
-            file_name="parsed_graph.csv",
-            mime="text/csv",
-            key="dl_graph_csv",
+        # --- Version selection and issuer tables (restored) ---
+        st.subheader("Select Versions")
+
+        possible_vars = [c for c in ["coupon", "strike", "reoffer", "barrier"] if c in df_all.columns]
+        if not possible_vars:
+            st.warning("No standard metric columns (coupon, strike, reoffer, barrier) found in parsed data.")
+            st.stop()
+        solve_var = st.selectbox(
+            "Select variable you are solving for:",
+            options=possible_vars,
+            index=0,
+            key="graph_solve_var",
         )
+
+        st.caption("Select Key Components:")
+        label_map = {
+            "underlyings": "Underlyings",
+            "tenor": "Tenor",
+            "barrier_type": "Barrier type",
+            "barrier": "Barrier",
+            "no_call_period": "No call period",
+            "strike": "Strike",
+            "coupon": "Coupon",
+            "reoffer": "Reoffer",
+        }
+        help_map = {
+            "underlyings": "Group by the underlying basket (codes 1..5)",
+            "tenor": "Tenor in months",
+            "barrier_type": "European/American",
+            "barrier": "Barrier level (%)",
+            "no_call_period": "Autocall from period (months)",
+            "strike": "Put strike (%)",
+            "coupon": "Coupon % p.a.",
+            "reoffer": "Reoffer (%)",
+        }
+        comp_order = [
+            "underlyings", "tenor", "barrier_type", "barrier",
+            "no_call_period", "strike", "coupon", "reoffer",
+        ]
+        comp_default = {k: True for k in comp_order}
+        comp_default["reoffer"] = False
+        components, selected_labels = [], []
+        per_row = 4
+        for row_start in range(0, len(comp_order), per_row):
+            row_items = comp_order[row_start:row_start+per_row]
+            ccols = st.columns(len(row_items))
+            for j, name in enumerate(row_items):
+                label = label_map[name]
+                disabled = (name == solve_var)
+                checked = comp_default[name] and not disabled
+                with ccols[j]:
+                    val = st.checkbox(label, value=checked, disabled=disabled, help=help_map.get(name), key=f"graph_ck_{name}")
+                if val:
+                    components.append(name)
+                    selected_labels.append(label)
+        st.caption("Current key: " + (" + ".join(selected_labels) if selected_labels else "(none)"))
+
+        def _get_version_labels_and_map(df: pd.DataFrame, components: list[str], solve_var: str):
+            tmp = df.copy()
+            tmp = tmp.assign(_version_key=_make_key(tmp, components))
+            asc_local = False if solve_var == "coupon" else True
+            grp = (
+                tmp.groupby("_version_key")
+                .agg(
+                    rows=(solve_var, "size"),
+                    issuers=("issuer", lambda s: len(set([str(x) for x in s if pd.notna(x)]))),
+                    issuer_list=(
+                        "issuer",
+                        lambda s: sorted({ _abbr(x) for x in s if pd.notna(x) and str(x).strip() })
+                    ),
+                    metric=(solve_var, "mean"),
+                )
+                .reset_index()
+                .sort_values(by=["metric"], ascending=asc_local)
+            )
+            recs = grp.to_dict("records")
+            def _label(rec: dict) -> str:
+                key = rec.get("_version_key", "")
+                key_disp = _bold_text(str(key))
+                cnt = int(rec.get("issuers", 0))
+                ilist = list(rec.get("issuer_list", []))
+                if len(ilist) > 10:
+                    ilist = ilist[:10] + [f"+{len(ilist)-10}"]
+                issuers_txt = ", ".join(ilist) if ilist else "-"
+                return f"{key_disp} ({cnt} issuers: {issuers_txt})"
+            labels = [_label(r) for r in recs]
+            vmap = {lab: r.get("_version_key", "") for lab, r in zip(labels, recs)}
+            return labels, vmap, recs
+
+        version_labels, version_map, recs_internal = _get_version_labels_and_map(df_all, components, solve_var)
+
+        mode = st.radio("Mode:", options=["Single version", "Compare versions"], index=0, key="graph_mode")
+        if mode == "Single version":
+            selected_label = st.selectbox("Choose version", options=(version_labels or ["(no versions)"]), key="graph_sel_version")
+            selected_versions = [version_map[selected_label]] if version_labels else []
+        else:
+            selected_labels_multi = st.multiselect("Choose versions", options=version_labels, default=version_labels[:2], key="graph_multi_versions")
+            selected_versions = [version_map[l] for l in selected_labels_multi]
+
+        if st.button("Confirm Selection", key="graph_confirm"):
+            df_view = df_all.copy().assign(_version_key=_make_key(df_all.copy(), components))
+            out = df_view[df_view["_version_key"].isin(selected_versions)].copy() if selected_versions else df_view.copy()
+            metric = (solve_var or "coupon").lower()
+            asc = False if metric == "coupon" else True
+            if solve_var in out.columns:
+                out = out.sort_values(by=[solve_var], ascending=asc)
+            if "issuer" in out.columns:
+                out["issuer"] = out["issuer"].apply(_abbr)
+            out_display = out.where(out.notna(), "NA")
+
+            if mode == "Compare versions":
+                titles = [f"V{i+1}" for i in range(len(selected_versions))]
+                issuer_table_df = _build_issuer_compare_table_df(out, metric, selected_versions, titles)
+            else:
+                issuer_table_df = _build_issuer_table_df(out, metric)
+
+            st.subheader("Issuer Table")
+            st.dataframe(issuer_table_df, use_container_width=True)
+            st.download_button(
+                "Download Issuer Table CSV",
+                data=issuer_table_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"issuer_table_{metric}.csv",
+                mime="text/csv",
+                key="graph_dl_issuer",
+            )
+
+            st.subheader("Selected Rows")
+            st.dataframe(out_display, use_container_width=True)
+            st.download_button(
+                "Download Selected CSV",
+                data=out_display.to_csv(index=False).encode("utf-8"),
+                file_name="parsed_selection.csv",
+                mime="text/csv",
+                key="graph_dl_selected",
+            )
+
+        # Optional: preview the raw parsed data
+        with st.expander("Parsed Data Preview", expanded=False):
+            st.dataframe(df_all, use_container_width=True)
+            st.download_button(
+                "Download Parsed CSV",
+                data=df_all.to_csv(index=False).encode("utf-8"),
+                file_name="parsed_graph.csv",
+                mime="text/csv",
+                key="dl_graph_csv",
+            )
 with tab_email_pricing:
     st.subheader("Email Pricing")
     st.caption("Enter product details; we'll build a horizontal table email draft.")
@@ -686,57 +994,7 @@ def _bold_text(s: str) -> str:
             out.append(ch)
     return "".join(out)
 
-# Display ordering and ratings for issuer email table
-ISSUER_DISPLAY_RATINGS = [
-    ("Bank of America (Merrill Lynch)", "BOFA", "A- / A1"),
-    ("Banque Cantonale Vaudoise", "BCV", "AA / -"),
-    ("Barclays", "BARCLAYS", "A / A1"),
-    ("Basler Kantonalbank", "BKB", "AA+ / -"),
-    ("Banque Int. à Luxembourg", "BIL", "A- / A2"),
-    ("BBVA", "BBVA", "A+ / A3"),
-    ("BNP Paribas", "BNP", "A+ / Aa3"),
-    ("Canadian Imp. Bank of Comm.", "CIBC", "A+ / Aa2"),
-    ("Citi", "CITI", "A+ / A1"),
-    ("Cornèr Bank", "CORNER", "BBB+"),
-    ("Goldman Sachs", "GS", "A+ / A1"),
-    ("HSBC", "HSBC", "A+ / A1"),
-    ("JPMorgan", "JPM", "A+ / Aa2"),
-    ("Julius Bär", "JB", "- / A3"),
-    ("Leonteq", "LEONTEQ", "BBB"),
-    ("Luzerner KB", "LUKB", "AA+ / -"),
-    ("Marex", "MAREX", "BBB / -"),
-    ("Morgan Stanley", "MS", "A- / A1"),
-    ("Natixis", "NATIXIS", "A / A1"),
-    ("Nomura Bank International", "NOMURA", "A- / -"),
-    ("Raiffeisen", "RAIFFEISEN", "AA- / -"),
-    ("Société Générale", "SOCGEN", "A / A1"),
-    ("Swissquote", "SWISSQUOTE", "- / -"),
-    ("UBS", "UBS", "A+ /Aa2"),
-    ("Vontobel", "VONTOBEL", "- / A2"),
-    ("Zürcher Kantonalbank", "ZKB", "AAA / Aaa"),
-]
-
-def _best_values_by_issuer(df: pd.DataFrame, column: str, asc: bool) -> dict:
-    if column not in df.columns:
-        return {}
-    s = pd.to_numeric(df[column], errors="coerce")
-    tmp = pd.concat([df["issuer"], s.rename("val")], axis=1).dropna(subset=["val"])
-    if tmp.empty:
-        return {}
-    agg = tmp.groupby("issuer")["val"].agg("min" if asc else "max")
-    return agg.to_dict()
-
-def _format_var_value(val: Optional[float], var: str) -> str:
-    if val is None or pd.isna(val):
-        return "% p.a." if var == "coupon" else "%"
-    try:
-        v = float(val)
-    except Exception:
-        return "% p.a." if var == "coupon" else "%"
-    if var == "coupon":
-        return f"{v:.2f} % p.a."
-    else:
-        return f"{v:.2f} %"
+# (duplicate helpers removed; using early definitions above)
 
 def _build_issuer_table_text_from_df(df: pd.DataFrame, solve_var: str, asc: bool) -> str:
     values = _best_values_by_issuer(df, solve_var, asc)
@@ -756,111 +1014,7 @@ def _build_filled_coupon_table_text(df: pd.DataFrame) -> str:
             lines.append(f"{display}\t{rating}\t{_format_var_value(val, 'coupon')}")
     return "\n".join(lines)
 
-def _build_issuer_table_df(df: pd.DataFrame, solve_var: str) -> pd.DataFrame:
-    """Build issuer template table with dynamic sorting.
-    - Always display Emittent, Rating, Coupon
-    - Sort by: coupon desc; strike asc; barrier asc; default asc
-    - Coupon text shows numeric value or 'OUT' if missing
-    """
-    # Sorting rule
-    sort_var = (solve_var or "").strip().lower()
-    asc = True
-    if sort_var == "coupon":
-        asc = False
-    elif sort_var in ("strike", "barrier"):
-        asc = True
-    else:
-        asc = True
-
-    # Values for sorting and for coupon display
-    metric = sort_var if sort_var else "coupon"
-    sort_values = _best_values_by_issuer(df, metric, asc=asc)
-
-    rows = []
-    col_label = "Coupon" if metric == "coupon" else metric.title()
-    for display, code, rating in ISSUER_DISPLAY_RATINGS:
-        mval = sort_values.get(code)
-        if metric in ("coupon", "strike", "barrier"):
-            # Show OUT when missing for coupon/strike/barrier
-            if mval is None or pd.isna(mval):
-                cell_text = "OUT"
-            else:
-                if metric == "coupon":
-                    cell_text = f"{float(mval):.2f} % p.a."
-                else:
-                    cell_text = f"{float(mval):.2f} %"
-        else:
-            cell_text = _format_var_value(mval, metric)
-        rows.append({
-            "Emittent": display,
-            "Rating": rating,
-            col_label: cell_text,
-            "__sort__": (None if mval is None or pd.isna(mval) else float(mval)),
-        })
-
-    dfx = pd.DataFrame(rows)
-    dfx = dfx.sort_values(by=["__sort__"], ascending=asc, na_position="last").drop(columns=["__sort__"]) 
-    return dfx[["Emittent", "Rating", col_label]]
+ 
 
 
-def _build_issuer_compare_table_df(
-    df: pd.DataFrame,
-    solve_var: str,
-    versions: List[str],
-    titles: List[str],
-) -> pd.DataFrame:
-    """Build an issuer table with multiple version columns (V1, V2, ...).
-    Sorting is applied on the first version according to solve_var rule."""
-    metric = (solve_var or "coupon").lower()
-    asc = False if metric == "coupon" else True
-
-    # Prepare per-version value dicts
-    per_version_vals = []
-    for v in versions:
-        sub = df[df.get("_version_key") == v]
-        vals = _best_values_by_issuer(sub, metric, asc=asc)
-        per_version_vals.append(vals)
-
-    rows = []
-    # Build rows per issuer
-    for display, code, rating in ISSUER_DISPLAY_RATINGS:
-        row = {"Emittent": display, "Rating": rating}
-        # Guard: stop rendering if no data yet
-        if not isinstance(df_all, pd.DataFrame) or df_all.empty:
-            st.stop()
-        # Collect numeric sort keys per version
-        sort_keys = []
-        for idx, vals in enumerate(per_version_vals):
-            mval = vals.get(code)
-            if metric in ("coupon", "strike", "barrier"):
-                if mval is None or pd.isna(mval):
-                    txt = "OUT"
-                    sort_keys.append(None)
-                else:
-                    num = float(mval)
-                    if metric == "coupon":
-                        txt = f"{num:.2f} % p.a."
-                    else:
-                        txt = f"{num:.2f} %"
-                    sort_keys.append(num)
-            else:
-                txt = _format_var_value(mval, metric)
-                try:
-                    sort_keys.append(None if mval is None or pd.isna(mval) else float(mval))
-                except Exception:
-                    sort_keys.append(None)
-            colname = f"{titles[idx]} {('Coupon' if metric=='coupon' else metric.title())}"
-            row[colname] = txt
-        # Store sort keys for multi-key sort (V1, then V2, ...)
-        for si, sval in enumerate(sort_keys):
-            row[f"__sort_{si}"] = sval
-        rows.append(row)
-
-    dfx = pd.DataFrame(rows)
-    sort_cols = [c for c in dfx.columns if c.startswith("__sort_")]
-    if sort_cols:
-        dfx = dfx.sort_values(by=sort_cols, ascending=[asc]*len(sort_cols), na_position="last")
-        dfx = dfx.drop(columns=sort_cols)
-    # Order columns: Emittent, Rating, then version columns
-    version_cols = [c for c in dfx.columns if c not in ("Emittent", "Rating")]
-    return dfx[["Emittent", "Rating", *version_cols]]
+ 

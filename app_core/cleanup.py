@@ -45,6 +45,13 @@ def universal_cleanup(df: pd.DataFrame, issuer: str | None = None) -> pd.DataFra
             s = s.astype(str).str.replace("%", "", regex=False)
             df[col] = pd.to_numeric(s, errors="coerce")
 
+    # Treat sentinel autocall barriers (e.g., 999) or any value > 120 as not applicable
+    if "autocall_barrier" in df.columns:
+        try:
+            df.loc[df["autocall_barrier"] > 120, "autocall_barrier"] = np.nan
+        except Exception:
+            pass
+
     # Tenor to months
     def _parse_tenor_to_months(x):
         if pd.isna(x):

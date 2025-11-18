@@ -9,6 +9,7 @@ import requests
 from app_core.extractors import (
     extract_for_sender,
     EXTRACTOR_BY_ISSUER,
+    detect_issuer_from_sender,
 )
 from app_core.normalizers import normalize
 from app_core.pipeline import run_on_html
@@ -582,15 +583,37 @@ with tab_graph:
             msgs = _graph_get_messages(access_token, folder_id, top=int(graph_n))
             frames = []
             parsed_emails = 0
+            debug_rows = []
             for msg in msgs:
                 try:
                     html, sender = _graph_extract_html_and_sender(msg)
                     if not html:
                         continue
+                    issuer_guess = detect_issuer_from_sender(sender or "")
+                    raw_df = None
+                    raw_issuer = None
+                    extractor_error = None
+                    try:
+                        raw_df, raw_issuer = extract_for_sender(html, sender or "")
+                    except Exception as exc:
+                        extractor_error = repr(exc)
+                    debug_entry = {
+                        "Subject": msg.get("subject") or "(no subject)",
+                        "Sender": sender or "(missing)",
+                        "Detected issuer": issuer_guess or "(unmapped)",
+                        "Extractor issuer": raw_issuer or "(none)",
+                        "Extractor rows": 0 if raw_df is None else int(len(raw_df)),
+                    }
+                    if extractor_error:
+                        debug_entry["Notes"] = f"extract error: {extractor_error[:120]}"
                     df = run_on_html(html, sender)
                     if df is not None and not df.empty:
                         frames.append(df)
                         parsed_emails += 1
+                        debug_entry["Normalized rows"] = int(len(df))
+                    else:
+                        debug_entry["Normalized rows"] = 0
+                    debug_rows.append(debug_entry)
                 except Exception:
                     continue
             stats = {
@@ -599,14 +622,37 @@ with tab_graph:
                 "parsed_rows": int(sum(len(f) for f in frames)) if frames else 0,
             }
             st.session_state["df_all"] = pd.concat(frames, ignore_index=True) if frames else None
+            st.session_state["graph_debug_rows"] = debug_rows
             st.caption(
                 f"Processed {stats['retrieved_emails']} Graph emails • Parsed {stats['parsed_emails']} • Rows {stats['parsed_rows']}"
             )
+            if stats["parsed_emails"] > 0:
+                st.success(f"Detected structured pricing tables in {stats['parsed_emails']} email(s).")
+            else:
+                st.warning("Fetched emails, but none contained detectable pricing tables.")
 
     df_all = st.session_state.get("df_all")
+
     if not isinstance(df_all, pd.DataFrame) or df_all.empty:
         st.info("Click 'Start Parsing via Graph' to load emails.")
     else:
+        debug_rows = st.session_state.get("graph_debug_rows") or []
+
+        ms_rows = 0
+        if "issuer" in df_all.columns:
+            ms_rows = int(df_all["issuer"].astype(str).str.lower().eq("ms").sum())
+        if ms_rows > 0:
+            st.success(f"Morgan Stanley detected in the latest batch • {ms_rows} parsed row(s).")
+        elif "issuer" in df_all.columns:
+            st.warning("No Morgan Stanley rows detected in the latest batch.")
+        else:
+            st.info("Parsed data does not include an 'issuer' column, unable to check for Morgan Stanley.")
+
+        if debug_rows:
+            with st.expander("Email detection debug", expanded=False):
+                st.caption("Quick view of the last fetched messages and how the sender heuristics classified them.")
+                st.dataframe(pd.DataFrame(debug_rows), use_container_width=True)
+
         # --- Version selection and issuer tables (restored) ---
         st.subheader("Select Versions")
 

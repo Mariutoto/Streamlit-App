@@ -96,15 +96,35 @@ def newest_mail_items(folder, n: int = 20):
 
 
 def clean_html_from_mail_item(msg) -> str:
+    """Return a best-effort HTML string from an Outlook MailItem.
+
+    Preference order:
+    1) HTMLBody when present
+    2) Plain Body converted to simple HTML
+    """
     html = getattr(msg, "HTMLBody", "") or ""
-    soup = BeautifulSoup(html, "html.parser")
+    if not str(html).strip():
+        try:
+            body = getattr(msg, "Body", "") or ""
+            if body:
+                # minimal HTML wrapping for plain text
+                import html as _html
+                safe = _html.escape(str(body)).replace("\r\n", "<br>").replace("\n", "<br>")
+                html = f"<div>{safe}</div>"
+        except Exception:
+            html = ""
+    soup = BeautifulSoup(html or "", "html.parser")
     for q in soup.select("blockquote"):
         q.decompose()
     return str(soup)
 
 
 def resolve_smtp(msg) -> Optional[str]:
-    """Best-effort sender email address resolution for Outlook MailItem."""
+    """Best-effort sender SMTP address resolution for Outlook MailItem.
+
+    Handles both SMTP and Exchange (EX) senders.
+    """
+    # Direct MAPI property (PR_SENDER_EMAIL_ADDRESS_W)
     try:
         pa = msg.PropertyAccessor
         smtp = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001E")
@@ -112,15 +132,38 @@ def resolve_smtp(msg) -> Optional[str]:
             return str(smtp).lower()
     except Exception:
         pass
+
+    # Exchange objects often expose SenderEmailType == 'EX'
+    try:
+        typ = getattr(msg, "SenderEmailType", None)
+        if str(typ).upper() == "EX" and getattr(msg, "Sender", None) is not None:
+            exu = None
+            try:
+                exu = msg.Sender.GetExchangeUser()
+            except Exception:
+                exu = None
+            addr = None
+            if exu is not None:
+                try:
+                    addr = getattr(exu, "PrimarySmtpAddress", None)
+                except Exception:
+                    addr = None
+            if addr:
+                return str(addr).lower()
+    except Exception:
+        pass
+
+    # Fallbacks
     try:
         if msg.Sender is not None:
-            if hasattr(msg.Sender, "Address"):
+            if hasattr(msg.Sender, "Address") and msg.Sender.Address:
                 return str(msg.Sender.Address).lower()
-            if hasattr(msg.Sender, "Name"):
+            if hasattr(msg.Sender, "Name") and msg.Sender.Name:
                 return str(msg.Sender.Name).lower()
     except Exception:
         pass
     try:
-        return (msg.SenderEmailAddress or "").lower()
+        raw = getattr(msg, "SenderEmailAddress", "") or ""
+        return raw.lower() if raw else None
     except Exception:
         return None

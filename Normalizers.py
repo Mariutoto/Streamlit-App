@@ -1,3 +1,7 @@
+import pandas as pd
+import numpy as np
+
+
 def normalize_citi(df):
     df = df.copy()
 
@@ -15,7 +19,12 @@ def normalize_citi(df):
         "barrier_type": ["Barrier Type"],
         "barrier": ["KI Barrier (%)", "Barrier (%)", "KI Barrier"],
         "autocall_barrier": ["Autocall Barrier (%)", "KO Barrier (%)", "Early Termination Level (%)"],
-        "autocall_frequency": ["Autocall Frequency", "Observation Frequency (m)", "KO Frequency"],
+        "autocall_frequency": [
+            "Autocall Frequency",
+            "Observation Frequency (m)",
+            "KO Frequency",
+            "Coupon Frequency (m)",  # treat coupon frequency months as frequency labels
+        ],
         "no_call_period": ["No Call Period", "Non Callable Periods", "Non Autocallable Period"],
         "coupon": ["Coupon p.a. (%)", "Coupon (%)", "Fixed Coupon p.a. (%)"],
         # Include both Reoffer (%) and Upfront (%)
@@ -46,6 +55,98 @@ def normalize_citi(df):
     return df
 
 
+def normalize_nomura(df):
+    df = df.copy()
+
+    # Map Nomura headers to canonical fields
+    rename_options = {
+        "product": ["Product"],
+        "currency": ["Currency", "Ccy"],
+        "tenor": ["Tenor (m)", "Tenor"],
+        "underlying_1": ["BBG Code 1", "Underlying 1"],
+        "underlying_2": ["BBG Code 2", "Underlying 2"],
+        "underlying_3": ["BBG Code 3", "Underlying 3"],
+        "underlying_4": ["BBG Code 4", "Underlying 4"],
+        "underlying_5": ["BBG Code 5", "Underlying 5"],
+        "strike": ["Strike (%)", "Strike %", "Strike"],
+        "barrier_type": ["Barrier Type", "KI Type", "EKI"],
+        "barrier": ["KI Barrier (%)", "Barrier (%)", "KI Barrier"],
+        "autocall_barrier": ["KO Barrier (%)", "Autocall Barrier (%)", "Early Termination Level (%)"],
+        "autocall_frequency": ["Observation Frequency (m)", "KO Type", "Autocall Frequency"],
+        "no_call_period": ["No Call Period", "Non Autocallable Period"],
+        "coupon": ["Coupon p.a. (%)", "Coupon (%)"],
+        # Nomura uses "Upfront / NotePrice (%)"; interpret as Note Price and convert to reoffer
+        "reoffer": ["Reoffer (%)", "Upfront (%)", "Upfront / NotePrice (%)", "NotePrice (%)"],
+        "message": ["Comment"],
+        "ref": ["SQID", "Ref"],
+        "notional": ["Max Size"],
+    }
+
+    # Build rename map
+    rename_map = {}
+    for target, variants in rename_options.items():
+        for v in variants:
+            if v in df.columns:
+                rename_map[v] = target
+                break
+    df = df.rename(columns=rename_map)
+
+    # Map frequency months to labels if provided as a number
+    if "autocall_frequency" in df.columns:
+        acf = df["autocall_frequency"]
+        acf_num = pd.to_numeric(acf, errors="coerce")
+        mapping = {1: "Monthly", 3: "Quarterly", 6: "Semi-Annual", 12: "Annual"}
+        df["autocall_frequency"] = acf_num.map(mapping).fillna(acf)
+
+    # Convert reoffer strings to numeric note price (% as provided by Nomura)
+    if "reoffer" in df.columns:
+        s = df["reoffer"].astype(str)
+        s = s.str.extract(r"([\d\.,]+)", expand=False).str.replace(",", ".", regex=False)
+        num = pd.to_numeric(s, errors="coerce")
+        df["reoffer"] = num
+
+    # Barrier type: map EKI -> European (Nomura wording)
+    if "barrier_type" in df.columns:
+        bt = df["barrier_type"].astype(str).str.strip()
+        df["barrier_type"] = (
+            bt.str.upper()
+              .replace({
+                  "EKI": "European",
+                  "AKI": "American",  # common synonym; harmless if unused
+              })
+        )
+
+    # Observation Frequency (m): numeric to label (1->Monthly, 3->Quarterly, 6->Semi-Annual, 12->Annual)
+    if "autocall_frequency" in df.columns:
+        acf = df["autocall_frequency"].copy()
+        # Prefer numeric mapping when value looks like months count
+        acf_num = pd.to_numeric(acf, errors="coerce")
+        mapping = {1: "Monthly", 3: "Quarterly", 6: "Semi-Annual", 12: "Annual"}
+        df["autocall_frequency"] = acf_num.map(mapping).fillna(acf)
+
+    # Ensure required columns exist
+    required = [
+        "product", "currency", "tenor", "underlying_1", "underlying_2", "underlying_3",
+        "underlying_4", "underlying_5", "strike", "barrier_type", "barrier", "coupon",
+        "reoffer", "autocall_barrier", "autocall_frequency", "no_call_period",
+    ]
+    for col in required:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Clean underlyings to ticker roots (before first space)
+    for col in ["underlying_1", "underlying_2", "underlying_3", "underlying_4", "underlying_5"]:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.split(" ", n=1).str[0]
+                .replace({"": pd.NA, "nan": pd.NA, "NaN": pd.NA, "None": pd.NA})
+            )
+
+    return df
+
 def normalize_natixis(df):
     df = df.copy()
 
@@ -65,7 +166,7 @@ def normalize_natixis(df):
         "underlying_5": ["BBG Code 5", "Underlying 5", "Underlying_5", "Ticker 5"],
         "barrier_type": ["Barrier Type", "KI Type"],
         "autocall_barrier": ["Early Termination Level (%)", "Autocall Level (%)", "Autocall Trigger (%)"],
-        "autocall_frequency": ["Early Termination Period", "KO Frequency", "Autocall Frequency"],
+        "autocall_frequency": ["Early Termination Period", "KO Frequency", "Autocall Frequency", "Coupon Period"],
         "no_call_period": ["Non Autocallable Period", "Non callable Period", "No Call Period"],
         "memory_coupon": ["Memory coupon", "Memory Coupon", "Has Memory"],
         "basket_type": ["Basket Type", "Underlying Basket Type"],
@@ -336,7 +437,7 @@ def normalize_bnp(df):
         "strike": ["Strike (%)", "Strike %", "Strike"],
         "barrier_type": ["Barrier Type"],
         "barrier": ["KI Barrier (%)", "Barrier (%)"],
-        "autocall_frequency": ["Early Termination Period"],
+        "autocall_frequency": ["Early Termination Period","Coupon Frequency"],
         "no_call_period": ["Non Autocallable Period", "Non Callable Period"],
         "autocall_barrier": ["Early Termination Level (%)"],
         "coupon": [
@@ -378,33 +479,42 @@ def normalize_bnp(df):
 def normalize_lukb(df):
     df = df.copy()
 
-    rename_map = {
-        "Product": "product",
-        "Wrapper": "wrapper",
-        "Currency": "currency",
-        "Size": "notional",
-        "Tenor (m)": "tenor",
-        "BBG Code 1": "underlying_1",
-        "BBG Code 2": "underlying_2",
-        "BBG Code 3": "underlying_3",
-        "BBG Code 4": "underlying_4",
-        "BBG Code 5": "underlying_5",
-        "Settlement": "settlement",
-        "Strike (%)": "strike",
-        "Strike Type": "strike_type",
-        "Barrier Type": "barrier_type",
-        "KI Barrier (%)": "barrier",
-        "Early Termination Period": "autocall_frequency",
-        "Non Callable Period": "no_call_period",
-        "Early Termination Level (%)": "autocall_barrier",
-        "Early Termination StepUp/Down (%)": "stepupdown",
-        "Coupon p.a. (%)": "coupon",
-        "Trigger Level (%)": "trigger_level",
-        "Memory Coupon": "memory_coupon",
-        "Reoffer (%)": "reoffer",
+    rename_options = {
+        "product": ["Product"],
+        "wrapper": ["Wrapper"],
+        "currency": ["Currency"],
+        "notional": ["Size", "Notional"],
+        "tenor": ["Tenor (m)", "Tenor (M)", "Tenor"],
+        "underlying_1": ["BBG Code 1"],
+        "underlying_2": ["BBG Code 2"],
+        "underlying_3": ["BBG Code 3"],
+        "underlying_4": ["BBG Code 4"],
+        "underlying_5": ["BBG Code 5"],
+        "settlement": ["Settlement"],
+        "strike": ["Strike (%)"],
+        "strike_type": ["Strike Type"],
+        "barrier_type": ["Barrier Type"],
+        "barrier": ["KI Barrier (%)"],
+        "autocall_frequency": ["Callable Period", "Early Termination Period","Coupon Frequency"],
+        "no_call_period": ["Non Callable Period", "Non Autocallable Period"],
+        "autocall_barrier": ["Early Termination Level (%)"],
+        "stepupdown": ["Early Termination StepUp/Down (%)"],
+        "coupon": ["Coupon p.a. (%)"],
+        "trigger_level": ["Trigger Level (%)"],
+        "memory_coupon": ["Memory Coupon"],
+        "reoffer": ["Reoffer (%)", "Upfront (%)"],
     }
 
-    df = df.rename(columns=rename_map)
+    # --- Dynamic rename ---
+    rename_map = {}
+    for target, variants in rename_options.items():
+        for variant in variants:
+            if variant in df.columns:
+                rename_map[variant] = target
+                break
+
+        df = df.rename(columns=rename_map)
+
 
     # --- Adjust reoffer: remove Swiss 8% tax uplift ---
     if "reoffer" in df.columns:
@@ -435,7 +545,7 @@ def normalize_jb(df):
         "strike": ["Strike (%)"],
         "barrier_type": ["Barrier Type"],
         "barrier": ["KI Barrier (%)"],
-        "autocall_frequency": ["Callable Period", "Early Termination Period"],
+        "autocall_frequency": ["Callable Period", "Early Termination Period","Coupon Frequency"],
         "no_call_period": ["Non Callable Period", "Non Autocallable Period"],
         "coupon": ["Coupon p.a. (%)"],
         "reoffer": ["Reoffer (%)", "Upfront (%)"],
@@ -511,7 +621,7 @@ def normalize_hsbc(df):
         "strike": ["Strike (%)", "Strike %", "Strike"],
         "barrier_type": ["Barrier Type", "KI Type"],
         "barrier": ["KI Barrier (%)", "Barrier (%)"],
-        "autocall_frequency": ["Early Termination Period", "Autocall Frequency"],
+        "autocall_frequency": ["Early Termination Period", "Autocall Frequency", "Coupon Frequency"],
         "no_call_period": ["Non Autocallable Period", "No Call Period"],
         "coupon": ["Coupon p.a. (%)", "Coupon (%)", "Coupon"],
         "reoffer": ["Reoffer (%)", "Reoffer", "Reoffer Price"],
@@ -647,7 +757,24 @@ def normalize_ms(df):
 
     # --- Standardize text formats ---
     if "barrier_type" in df.columns:
-        df["barrier_type"] = df["barrier_type"].astype(str).str.title()
+        def _normalize_barrier_type(value: str):
+            text = str(value or "").strip()
+            if not text:
+                return None
+            lowered = text.lower()
+            # Morgan Stanley sometimes labels DIP Euro / DIP Cont; map them to standard obs styles
+            if "dip" in lowered:
+                if any(token in lowered for token in ("cont", "continuous", "amer")):
+                    return "American"
+                if any(token in lowered for token in ("eur", "euro")):
+                    return "European"
+            if "amer" in lowered:
+                return "American"
+            if any(token in lowered for token in ("eur", "euro")):
+                return "European"
+            return text.title()
+
+        df["barrier_type"] = df["barrier_type"].apply(_normalize_barrier_type)
 
     if "autocall_frequency" in df.columns:
         freq_map = {
@@ -699,6 +826,7 @@ def normalize_jpm(df):
             "KO Frequency",
             "Autocall Frequency",
             "Observation Frequency",
+            "Issuer Callable Frequency"
         ],
         "no_call_period": [
             "Non Autocallable Period",
@@ -845,25 +973,31 @@ def normalize_ubs(df):
 
 def normalize_marex(df):
     df = df.copy()
-    rename_map = {
-        "Structure": "product",
-        "Currency": "currency",
-        "Bloomberg Ticker 1": "underlying_1",
-        "Bloomberg Ticker 2": "underlying_2",
-        "Bloomberg Ticker 3": "underlying_3",
-        "Bloomberg Ticker 4": "underlying_4",
-        "Bloomberg Ticker 5": "underlying_5",
-        "Bloomberg Ticker 6": "underlying_6",   # optional, not in core schema
-        "Reoffer / Upfront (%)": "reoffer",
-        "Tenor (m)": "tenor",
-        "Frequency": "autocall_frequency",
-        "First Observation in (m)": "no_call_period",
-        "Autocall Trigger Level (%)": "autocall_barrier",
-        "Coupon p.a. (%)": "coupon",
-        "Strike Level (%)": "strike",
-        "Barrier Type": "barrier_type",
-        "Barrier Level": "barrier",
+    # Flexible header variants
+    rename_options = {
+        "product": ["Structure", "Product"],
+        "currency": ["Currency"],
+        "underlying_1": ["Bloomberg Ticker 1", "BBG Code 1", "Underlying 1"],
+        "underlying_2": ["Bloomberg Ticker 2", "BBG Code 2", "Underlying 2"],
+        "underlying_3": ["Bloomberg Ticker 3", "BBG Code 3", "Underlying 3"],
+        "underlying_4": ["Bloomberg Ticker 4", "BBG Code 4", "Underlying 4"],
+        "underlying_5": ["Bloomberg Ticker 5", "BBG Code 5", "Underlying 5"],
+        "reoffer": ["Reoffer / Upfront (%)", "Upfront (%)", "Reoffer (%)", "Price Result", "Issue Price (%)"],
+        "tenor": ["Tenor (m)", "Tenor", "Tenor (months)", "Maturity", "Maturity (m)"],
+        "autocall_frequency": ["Frequency", "Observation Frequency (m)", "Coupon Frequency (m)", "KO Frequency"],
+        "no_call_period": ["First Observation in (m)", "No Call Period", "Non Autocallable Period", "Autocall From Period"],
+        "autocall_barrier": ["Autocall Trigger Level (%)", "Autocall Level (%)", "KO Barrier (%)", "Early Termination Level (%)"],
+        "coupon": ["Coupon p.a. (%)", "Coupon (%)"],
+        "strike": ["Strike Level (%)", "Strike (%)"],
+        "barrier_type": ["Barrier Type", "KI Type", "EKI"],
+        "barrier": ["Barrier Level", "KI Barrier (%)", "Barrier (%)"],
     }
+    rename_map = {}
+    for target, variants in rename_options.items():
+        for variant in variants:
+            if variant in df.columns:
+                rename_map[variant] = target
+                break
     df = df.rename(columns=rename_map)
 
     # Clean numeric fields
@@ -881,6 +1015,13 @@ def normalize_marex(df):
             df["tenor"].astype(str).str.replace("m", "", case=False, regex=False)
         )
         df["tenor"] = pd.to_numeric(df["tenor"], errors="coerce")
+
+    # Map frequency months to labels if numeric
+    if "autocall_frequency" in df.columns:
+        acf = df["autocall_frequency"]
+        acf_num = pd.to_numeric(acf, errors="coerce")
+        mapping = {1: "Monthly", 3: "Quarterly", 6: "Semi-Annual", 12: "Annual"}
+        df["autocall_frequency"] = acf_num.map(mapping).fillna(acf)
 
     if "autocall_frequency" in df.columns and "no_call_period" in df.columns:
         # map frequency to months
@@ -902,6 +1043,17 @@ import pandas as pd
 def normalize_bbva(df):
     df = df.copy()
 
+    # --- Clean up raw headers (BBVA often has double spaces and trailing asterisks) ---
+    import re
+    cleaned_cols = []
+    for c in df.columns:
+        col = str(c).replace("\xa0", " ")
+        col = re.sub(r"\s+", " ", col).strip()
+        # Drop trailing footnote markers like '*'
+        col = col.rstrip("*")
+        cleaned_cols.append(col)
+    df.columns = cleaned_cols
+
     # --- Define possible variants per logical column ---
     rename_options = {
         "product": ["Product"],
@@ -914,7 +1066,15 @@ def normalize_bbva(df):
         "underlying_5": ["BBG Code 5"],
         "strike": ["Strike (%)", "Strike (%)*", "Strike"],
         "barrier_type": ["Barrier Type", "KI Type", "KI Barrier Type"],
-        "barrier": ["KI Barrier Level (%)", "KI Barrier (%)", "Barrier (%)"],
+        # Normalize to 'barrier' regardless of spacing or footnote symbols
+        "barrier": [
+            "KI Barrier Level (%)",
+            "KI Barrier (%)",
+            "Barrier (%)",
+            # common BBVA header variants after cleanup
+            "KI Barrier Level (%)",
+            "KI Barrier Level (%) "
+        ],
         "autocall_frequency": [
             "Frequency (1m, 3m, 6m, 12m)",
             "ER Frequency (1m, 3m, 6m, 12m)",
@@ -924,6 +1084,7 @@ def normalize_bbva(df):
             "Autocall Trigger Level (%)",
             "ER Trigger (%)",
             "ER Coupon Type",
+            "Coupon Frequency"
         ],
         "coupon": [
             "Coupon (%)",
